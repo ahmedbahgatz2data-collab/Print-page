@@ -17,7 +17,7 @@ jobs:
         run: pip install selenium pyinstaller
 
       - name: Build exe
-        run: pyinstaller --onefile --windowed --name WebToPDF web_to_pdf_gui.py
+        run: pyinstaller --onefile --windowed --clean --collect-all selenium --name WebToPDF web_to_pdf_gui.py
 
       - uses: actions/upload-artifact@v4
         with:
