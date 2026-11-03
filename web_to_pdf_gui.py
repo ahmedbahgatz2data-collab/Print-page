@@ -85,9 +85,23 @@ REC_JS = r"""
 """
 
 
+PAGE_SIZES = {
+    "A3": ("ISO_A3", 297000, 420000),
+    "A4": ("ISO_A4", 210000, 297000),
+    "A5": ("ISO_A5", 148000, 210000),
+    "Letter": ("NA_LETTER", 215900, 279400),
+    "Legal": ("NA_LEGAL", 215900, 355600),
+    "Tabloid": ("NA_LEDGER", 279400, 431800),
+}
+
+
 def safe_name(text, max_len=80):
-    text = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", text).strip()
-    return text[:max_len] or "page"
+    """Make a title safe as a Windows file name, so Chrome does not need to change it.
+    Windows does not allow names that end with a dot or a space."""
+    text = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text[:max_len].strip(" .")
+    return text or "page"
 
 
 def xpath_literal(s):
@@ -144,8 +158,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Web Pages to PDF")
-        self.geometry("1020x800")
-        self.minsize(900, 720)
+        self.geometry("1020x870")
+        self.minsize(900, 780)
 
         self.msg_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -158,10 +172,14 @@ class App(tk.Tk):
         self.var_folder = tk.StringVar()
         self.var_driver = tk.StringVar()
         self.var_scale = tk.IntVar(value=100)
-        self.var_wait = tk.IntVar(value=5)
+        self.var_wait = tk.IntVar(value=20)
         self.var_load_wait = tk.IntVar(value=5)
         self.var_use_title = tk.BooleanVar(value=True)
         self.var_stop_loading = tk.BooleanVar(value=True)
+        self.var_page_size = tk.StringVar(value="Browser default")
+        self.var_landscape = tk.BooleanVar(value=False)
+        self.var_dedupe = tk.BooleanVar(value=True)
+        self.var_browser_mode = tk.StringVar(value="each")
         self.var_step_timeout = tk.DoubleVar(value=10)
         self.var_step_delay = tk.DoubleVar(value=1)
         self.var_after_steps = tk.DoubleVar(value=2)
@@ -194,13 +212,38 @@ class App(tk.Tk):
         ttk.Spinbox(opts, from_=10, to=200, width=6, textvariable=self.var_scale).pack(side="left", padx=(4, 16))
         ttk.Label(opts, text="Page load wait (s):").pack(side="left")
         ttk.Spinbox(opts, from_=1, to=120, width=6, textvariable=self.var_load_wait).pack(side="left", padx=(4, 16))
-        ttk.Label(opts, text="PDF save wait (s):").pack(side="left")
-        ttk.Spinbox(opts, from_=1, to=120, width=6, textvariable=self.var_wait).pack(side="left", padx=(4, 16))
+        ttk.Label(opts, text="PDF save timeout (s):").pack(side="left")
+        ttk.Spinbox(opts, from_=1, to=300, width=6, textvariable=self.var_wait).pack(side="left", padx=(4, 16))
+
+        pg = ttk.Frame(box)
+        pg.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(pg, text="Page size:").pack(side="left")
+        ttk.Combobox(
+            pg, textvariable=self.var_page_size, state="readonly", width=16,
+            values=["Browser default"] + list(PAGE_SIZES),
+        ).pack(side="left", padx=(4, 16))
+        ttk.Checkbutton(pg, text="Landscape", variable=self.var_landscape).pack(side="left")
+
+        br = ttk.Frame(box)
+        br.grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(br, text="Browser:").pack(side="left")
+        ttk.Radiobutton(
+            br, text="Close and reopen after every URL",
+            variable=self.var_browser_mode, value="each",
+        ).pack(side="left", padx=(4, 12))
+        ttk.Radiobutton(
+            br, text="One browser for all URLs",
+            variable=self.var_browser_mode, value="single",
+        ).pack(side="left")
 
         checks = ttk.Frame(box)
-        checks.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        checks.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
         ttk.Checkbutton(checks, text="Use page title as file name", variable=self.var_use_title).pack(side="left", padx=(0, 20))
-        ttk.Checkbutton(checks, text="Stop page loading before running steps", variable=self.var_stop_loading).pack(side="left")
+        ttk.Checkbutton(checks, text="Stop page loading before running steps", variable=self.var_stop_loading).pack(side="left", padx=(0, 20))
+        ttk.Checkbutton(
+            checks, text="Remove duplicate links automatically",
+            variable=self.var_dedupe, command=self.update_link_count,
+        ).pack(side="left")
 
         # ----- Links + Steps -----
         mid = ttk.Frame(self)
@@ -281,14 +324,25 @@ class App(tk.Tk):
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
 
     # ---------------- helpers ----------------
+    def update_link_count(self):
+        all_links = self.get_links(dedupe=False)
+        links = self.get_links()
+        text = f"{len(links)} links"
+        if len(all_links) != len(links):
+            text += f" ({len(all_links) - len(links)} duplicates ignored)"
+        self.lbl_count.config(text=text)
+
     def on_links_modified(self, _event=None):
         if self.txt_links.edit_modified():
-            self.lbl_count.config(text=f"{len(self.get_links())} links")
+            self.update_link_count()
             self.txt_links.edit_modified(False)
 
-    def get_links(self):
+    def get_links(self, dedupe=True):
         raw = self.txt_links.get("1.0", "end").splitlines()
-        return [x.strip() for x in raw if x.strip()]
+        links = [x.strip() for x in raw if x.strip()]
+        if dedupe and self.var_dedupe.get():
+            links = list(dict.fromkeys(links))  # keeps first occurrence and order
+        return links
 
     def pick_folder(self):
         d = filedialog.askdirectory(title="Choose save folder")
@@ -588,11 +642,17 @@ class App(tk.Tk):
             "after_steps": num(self.var_after_steps, 2),
             "continue_missing": self.var_continue.get(),
             "steps": json.loads(json.dumps(self.steps)),
+            "page_size": self.var_page_size.get(),
+            "landscape": self.var_landscape.get(),
+            "new_browser": self.var_browser_mode.get() == "each",
         }
         self.stop_event.clear()
         self.btn_start.config(state="disabled")
         self.btn_record.config(state="disabled")
         self.btn_stop.config(state="normal")
+        dupes = len(self.get_links(dedupe=False)) - len(links)
+        if dupes:
+            self.msg_queue.put(("log", f"Ignored {dupes} duplicate link(s). Processing {len(links)} unique link(s)."))
         self.msg_queue.put(("progress", (0, len(links))))
         self.worker = threading.Thread(target=self.run_job, args=(links, cfg), daemon=True)
         self.worker.start()
@@ -608,10 +668,18 @@ class App(tk.Tk):
             "selectedDestinationId": "Save as PDF",
             "version": 2,
             "isHeaderFooterEnabled": False,
-            "isLandscapeEnabled": False,
+            "isLandscapeEnabled": cfg["landscape"],
             "scalingType": 3,
             "scaling": str(cfg["scale"]),
         }
+        if cfg["page_size"] in PAGE_SIZES:
+            name, w, h = PAGE_SIZES[cfg["page_size"]]
+            settings["mediaSize"] = {
+                "name": name,
+                "width_microns": w,
+                "height_microns": h,
+                "custom_display_name": cfg["page_size"],
+            }
         prefs = {
             "printing.print_preview_sticky_settings.appState": json.dumps(settings),
             "savefile.default_directory": cfg["folder"],
@@ -658,11 +726,80 @@ class App(tk.Tk):
             q.put(("log", f"   step {n}: clicked {clicked} element(s)"))
             time.sleep(cfg["step_delay"])
 
+    @staticmethod
+    def driver_alive(driver):
+        try:
+            _ = driver.window_handles
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def close_driver(driver):
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    @staticmethod
+    def pdf_names(folder):
+        try:
+            return {f for f in os.listdir(folder) if f.lower().endswith(".pdf")}
+        except OSError:
+            return set()
+
+    def new_driver(self, cfg):
+        return webdriver.Chrome(service=make_service(cfg["driver"]), options=self.make_options(cfg))
+
+    def wait_for_new_pdf(self, folder, before, timeout):
+        """Wait for a new PDF to appear and finish writing. Returns its real file name."""
+        deadline = time.time() + timeout
+        sizes = {}
+        while time.time() < deadline:
+            for name in sorted(self.pdf_names(folder) - before):
+                try:
+                    size = os.path.getsize(os.path.join(folder, name))
+                except OSError:
+                    continue
+                if size > 0 and sizes.get(name) == size:
+                    return name
+                sizes[name] = size
+            time.sleep(0.4)
+        return None
+
+    def process_url(self, driver, i, link, cfg):
+        driver.get(link)
+        time.sleep(cfg["load_wait"])
+        if cfg["stop_loading"]:
+            driver.execute_script("window.stop();")
+
+        if cfg["steps"]:
+            self.run_steps(driver, cfg)
+            time.sleep(cfg["after_steps"])
+
+        stamp = time.strftime("%H-%M-%S")
+        if cfg["use_title"]:
+            filename = f"{i + 1:03d} - {safe_name(driver.title)}"
+        else:
+            filename = f"filename{i}{stamp}"
+        if os.path.exists(os.path.join(cfg["folder"], filename + ".pdf")):
+            filename += f" {stamp}"  # avoid Chrome adding " (1)" to the name
+
+        before = self.pdf_names(cfg["folder"])
+        driver.execute_script(f"document.title = {json.dumps(filename)};")
+        driver.execute_script("window.print();")
+        saved = self.wait_for_new_pdf(cfg["folder"], before, cfg["wait"])
+        if not saved:
+            raise RuntimeError(f"PDF file did not appear within {cfg['wait']} s")
+        return saved, driver.current_url
+
     def run_job(self, links, cfg):
         q = self.msg_queue
         total = len(links)
         status_path = os.path.join(cfg["folder"], "Output Status.txt")
         new_file = not os.path.exists(status_path)
+        driver = None
 
         try:
             with open(status_path, "a", encoding="utf-8") as out:
@@ -675,40 +812,29 @@ class App(tk.Tk):
                         break
 
                     q.put(("log", f"[{i + 1}/{total}] {link}"))
-                    stamp = time.strftime("%H-%M-%S")
-                    filename = f"filename{i}{stamp}"
                     try:
-                        with webdriver.Chrome(
-                            service=make_service(cfg["driver"]), options=self.make_options(cfg)
-                        ) as driver:
-                            driver.get(link)
-                            time.sleep(cfg["load_wait"])
-                            if cfg["stop_loading"]:
-                                driver.execute_script("window.stop();")
-
-                            if cfg["steps"]:
-                                self.run_steps(driver, cfg)
-                                time.sleep(cfg["after_steps"])
-
-                            if cfg["use_title"]:
-                                title = safe_name(driver.title)
-                                filename = f"{i + 1:03d} - {title}"
-
-                            driver.execute_script(f"document.title = {json.dumps(filename)};")
-                            driver.execute_script("window.print();")
-                            time.sleep(cfg["wait"])
-                            row = f"{link}\t{driver.current_url}\t{filename}.pdf\t{datetime.datetime.now()}\n"
-                        q.put(("log", f"   saved: {filename}.pdf"))
+                        if driver is None:
+                            driver = self.new_driver(cfg)
+                        saved, current_url = self.process_url(driver, i, link, cfg)
+                        row = f"{link}\t{current_url}\t{saved}\t{datetime.datetime.now()}\n"
+                        q.put(("log", f"   saved: {saved}"))
                     except Exception as e:
                         short = str(e).splitlines()[0] if str(e) else type(e).__name__
                         row = f"{link}\tError: {short}\tError\t{datetime.datetime.now()}\n"
                         q.put(("log", f"   error: {short}"))
+                    finally:
+                        # Close after every URL, or when the shared browser died / was closed
+                        if driver is not None and (cfg["new_browser"] or not self.driver_alive(driver)):
+                            self.close_driver(driver)
+                            driver = None
 
                     out.write(row)
                     out.flush()
                     q.put(("progress", (i + 1, total)))
         except Exception as e:
             q.put(("log", f"General error: {e}"))
+        finally:
+            self.close_driver(driver)
 
         q.put(("log", f"Finished. Results log: {status_path}"))
         q.put(("done", None))
