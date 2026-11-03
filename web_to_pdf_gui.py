@@ -2,6 +2,8 @@ import os
 import re
 import json
 import base64
+import sys
+import subprocess
 import time
 import queue
 import datetime
@@ -160,6 +162,19 @@ def parse_selector(sel):
     return By.CSS_SELECTOR, sel
 
 
+def open_file(path):
+    """Open a file with the default viewer (used to show the test PDF)."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        pass
+
+
 def make_service(path):
     return Service(executable_path=path) if path else Service()
 
@@ -211,11 +226,11 @@ class App(tk.Tk):
         self.var_load_wait = tk.IntVar(value=5)
         self.var_use_title = tk.BooleanVar(value=True)
         self.var_stop_loading = tk.BooleanVar(value=True)
-        self.var_page_size = tk.StringVar(value="Browser default")
+        self.var_page_size = tk.StringVar(value="A4")
         self.var_landscape = tk.BooleanVar(value=False)
         self.var_dedupe = tk.BooleanVar(value=True)
         self.var_browser_mode = tk.StringVar(value="each")
-        self.var_engine = tk.StringVar(value="kiosk")
+        self.var_engine = tk.StringVar(value="direct")
         self.var_custom_w = tk.DoubleVar(value=210)
         self.var_custom_h = tk.DoubleVar(value=297)
         self.var_step_timeout = tk.DoubleVar(value=10)
@@ -282,12 +297,12 @@ class App(tk.Tk):
         eng.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
         ttk.Label(eng, text="Print method:").pack(side="left")
         ttk.Radiobutton(
-            eng, text="Chrome print dialog (kiosk)",
-            variable=self.var_engine, value="kiosk",
+            eng, text="Direct PDF (recommended: exact size and scale)",
+            variable=self.var_engine, value="direct",
         ).pack(side="left", padx=(4, 12))
         ttk.Radiobutton(
-            eng, text="Direct PDF (hidden browser, exact size and scale)",
-            variable=self.var_engine, value="direct",
+            eng, text="Chrome print dialog (fallback)",
+            variable=self.var_engine, value="kiosk",
         ).pack(side="left")
 
         checks = ttk.Frame(box)
@@ -366,6 +381,8 @@ class App(tk.Tk):
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(ctrl, text="\u25A0 Stop", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
+        self.btn_test = ttk.Button(ctrl, text="Test on first link", command=self.test_first)
+        self.btn_test.pack(side="left")
         self.progress = ttk.Progressbar(ctrl, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=10)
         self.lbl_progress = ttk.Label(ctrl, text="0 / 0")
@@ -442,6 +459,7 @@ class App(tk.Tk):
                     self.btn_start.config(state="normal")
                     self.btn_stop.config(state="disabled")
                     self.btn_record.config(state="normal")
+                    self.btn_test.config(state="normal")
                 elif kind == "rec_step":
                     self.steps.append(data)
                     self.refresh_steps(select=len(self.steps) - 1)
@@ -450,6 +468,7 @@ class App(tk.Tk):
                     self.recording = False
                     self.btn_record.config(text="\u25CF Record clicks")
                     self.btn_start.config(state="normal")
+                    self.btn_test.config(state="normal")
                     self.log(f"Recording finished. {len(self.steps)} step(s) in the list.")
         except queue.Empty:
             pass
@@ -606,6 +625,7 @@ class App(tk.Tk):
         self.rec_stop.clear()
         self.btn_record.config(text="\u25A0 Stop recording")
         self.btn_start.config(state="disabled")
+        self.btn_test.config(state="disabled")
         self.log("Recording started. Click the elements you want in the browser window, "
                  "in order, then press 'Stop recording' here.")
         threading.Thread(
@@ -664,24 +684,22 @@ class App(tk.Tk):
             q.put(("rec_done", None))
 
     # ---------------- actions ----------------
-    def start(self):
-        if self.recording:
-            messagebox.showwarning("Warning", "Stop the recording first.")
-            return
+    def build_cfg(self):
+        """Validate the settings. Returns (links, cfg), or None if something is missing."""
         folder = self.var_folder.get().strip()
         links = self.get_links()
         if not folder:
             messagebox.showwarning("Warning", "Choose a save folder first.")
-            return
+            return None
         if not os.path.isdir(folder):
             try:
                 os.makedirs(folder)
             except OSError as e:
                 messagebox.showerror("Error", f"Could not create the folder:\n{e}")
-                return
+                return None
         if not links:
             messagebox.showwarning("Warning", "Add at least one link.")
-            return
+            return None
 
         cfg = {
             "folder": os.path.abspath(folder),
@@ -703,9 +721,21 @@ class App(tk.Tk):
             "custom_w": num(self.var_custom_w, 210),
             "custom_h": num(self.var_custom_h, 297),
         }
+        return links, cfg
+
+    def start(self):
+        if self.recording:
+            messagebox.showwarning("Warning", "Stop the recording first.")
+            return
+        built = self.build_cfg()
+        if not built:
+            return
+        links, cfg = built
+
         self.stop_event.clear()
         self.btn_start.config(state="disabled")
         self.btn_record.config(state="disabled")
+        self.btn_test.config(state="disabled")
         self.btn_stop.config(state="normal")
         dupes = len(self.get_links(dedupe=False)) - len(links)
         if dupes:
@@ -713,6 +743,60 @@ class App(tk.Tk):
         self.msg_queue.put(("progress", (0, len(links))))
         self.worker = threading.Thread(target=self.run_job, args=(links, cfg), daemon=True)
         self.worker.start()
+
+    def test_first(self):
+        """Run the current settings and steps on the first link only, then open the PDF."""
+        if self.recording:
+            messagebox.showwarning("Warning", "Stop the recording first.")
+            return
+        if self.worker is not None and self.worker.is_alive():
+            return
+        built = self.build_cfg()
+        if not built:
+            return
+        links, cfg = built
+
+        test_folder = os.path.join(cfg["folder"], "_test")
+        try:
+            os.makedirs(test_folder, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not create the test folder:\n{e}")
+            return
+        cfg = dict(cfg, folder=test_folder, test=True, new_browser=True)
+
+        self.stop_event.clear()
+        self.btn_start.config(state="disabled")
+        self.btn_test.config(state="disabled")
+        self.btn_record.config(state="disabled")
+        self.worker = threading.Thread(target=self.run_test, args=(links[0], cfg), daemon=True)
+        self.worker.start()
+
+    def run_test(self, link, cfg):
+        q = self.msg_queue
+        direct = cfg["engine"] == "direct"
+        size = cfg["page_size"]
+        if size == CUSTOM_SIZE:
+            size = f"Custom {cfg['custom_w']:g} x {cfg['custom_h']:g} mm"
+        elif size == "Browser default" and direct:
+            size = "A4 (default)"
+        orient = "landscape" if cfg["landscape"] else "portrait"
+        method = "Direct PDF" if direct else "Chrome print dialog"
+
+        q.put(("log", f"TEST on first link: {link}"))
+        q.put(("log", f"   settings: {size}, {orient}, scale {cfg['scale']}%, {method}, {len(cfg['steps'])} step(s)"))
+        driver = None
+        try:
+            driver = self.new_driver(cfg)
+            saved, _url = self.process_url(driver, 0, link, cfg)
+            q.put(("log", f"   test file: {saved}{self.describe_pdf(cfg, saved)}"))
+            q.put(("log", f"   opening it (saved in: {cfg['folder']})"))
+            open_file(os.path.join(cfg["folder"], saved))
+        except Exception as e:
+            short = str(e).splitlines()[0] if str(e) else type(e).__name__
+            q.put(("log", f"   test error: {short}"))
+        finally:
+            self.close_driver(driver)
+        q.put(("done", None))
 
     def stop(self):
         self.stop_event.set()
@@ -892,10 +976,12 @@ class App(tk.Tk):
             time.sleep(cfg["after_steps"])
 
         stamp = time.strftime("%H-%M-%S")
+        is_test = cfg.get("test", False)
         if cfg["use_title"]:
-            filename = f"{i + 1:03d} - {safe_name(driver.title)}"
+            prefix = "TEST" if is_test else f"{i + 1:03d}"
+            filename = f"{prefix} - {safe_name(driver.title)}"
         else:
-            filename = f"filename{i}{stamp}"
+            filename = f"TEST {stamp}" if is_test else f"filename{i}{stamp}"
         if os.path.exists(os.path.join(cfg["folder"], filename + ".pdf")):
             filename += f" {stamp}"  # avoid Chrome adding " (1)" to the name
 
