@@ -1,0 +1,25 @@
+name: Build exe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install selenium pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name WebToPDF web_to_pdf_gui.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WebToPDF
+          path: dist/WebToPDF.exe
