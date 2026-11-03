@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import time
 import queue
 import datetime
@@ -86,13 +87,47 @@ REC_JS = r"""
 
 
 PAGE_SIZES = {
+    "A0": ("ISO_A0", 841000, 1189000),
+    "A1": ("ISO_A1", 594000, 841000),
+    "A2": ("ISO_A2", 420000, 594000),
     "A3": ("ISO_A3", 297000, 420000),
     "A4": ("ISO_A4", 210000, 297000),
     "A5": ("ISO_A5", 148000, 210000),
+    "A6": ("ISO_A6", 105000, 148000),
+    "B4": ("ISO_B4", 250000, 353000),
+    "B5": ("ISO_B5", 176000, 250000),
     "Letter": ("NA_LETTER", 215900, 279400),
     "Legal": ("NA_LEGAL", 215900, 355600),
     "Tabloid": ("NA_LEDGER", 279400, 431800),
+    "Executive": ("NA_EXECUTIVE", 184150, 266700),
+    "Statement": ("NA_INVOICE", 139700, 215900),
+    "Folio": ("OM_FOLIO", 210000, 330000),
 }
+CUSTOM_SIZE = "Custom (mm)"
+
+
+def get_page_dims(cfg):
+    """Returns (name, width_microns, height_microns) or None for the browser default."""
+    size = cfg["page_size"]
+    if size in PAGE_SIZES:
+        return PAGE_SIZES[size]
+    if size == CUSTOM_SIZE:
+        return ("CUSTOM", int(cfg["custom_w"] * 1000), int(cfg["custom_h"] * 1000))
+    return None
+
+
+def pdf_page_size(path):
+    """Read the first page size (in points) from a PDF file, or None if not readable."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(3_000_000)
+    except OSError:
+        return None
+    m = re.search(rb"/MediaBox\s*\[\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*\]", data)
+    if not m:
+        return None
+    x0, y0, x1, y1 = (float(v) for v in m.groups())
+    return abs(x1 - x0), abs(y1 - y0)
 
 
 def safe_name(text, max_len=80):
@@ -158,8 +193,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Web Pages to PDF")
-        self.geometry("1020x870")
-        self.minsize(900, 780)
+        self.geometry("1020x910")
+        self.minsize(900, 830)
 
         self.msg_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -180,6 +215,9 @@ class App(tk.Tk):
         self.var_landscape = tk.BooleanVar(value=False)
         self.var_dedupe = tk.BooleanVar(value=True)
         self.var_browser_mode = tk.StringVar(value="each")
+        self.var_engine = tk.StringVar(value="kiosk")
+        self.var_custom_w = tk.DoubleVar(value=210)
+        self.var_custom_h = tk.DoubleVar(value=297)
         self.var_step_timeout = tk.DoubleVar(value=10)
         self.var_step_delay = tk.DoubleVar(value=1)
         self.var_after_steps = tk.DoubleVar(value=2)
@@ -220,9 +258,13 @@ class App(tk.Tk):
         ttk.Label(pg, text="Page size:").pack(side="left")
         ttk.Combobox(
             pg, textvariable=self.var_page_size, state="readonly", width=16,
-            values=["Browser default"] + list(PAGE_SIZES),
-        ).pack(side="left", padx=(4, 16))
-        ttk.Checkbutton(pg, text="Landscape", variable=self.var_landscape).pack(side="left")
+            values=["Browser default"] + list(PAGE_SIZES) + [CUSTOM_SIZE],
+        ).pack(side="left", padx=(4, 12))
+        ttk.Checkbutton(pg, text="Landscape", variable=self.var_landscape).pack(side="left", padx=(0, 16))
+        ttk.Label(pg, text="Custom size (mm):").pack(side="left")
+        ttk.Spinbox(pg, from_=20, to=2000, width=6, textvariable=self.var_custom_w).pack(side="left", padx=(4, 2))
+        ttk.Label(pg, text="x").pack(side="left")
+        ttk.Spinbox(pg, from_=20, to=2000, width=6, textvariable=self.var_custom_h).pack(side="left", padx=(2, 0))
 
         br = ttk.Frame(box)
         br.grid(row=4, column=0, columnspan=3, sticky="w", **pad)
@@ -236,8 +278,20 @@ class App(tk.Tk):
             variable=self.var_browser_mode, value="single",
         ).pack(side="left")
 
+        eng = ttk.Frame(box)
+        eng.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(eng, text="Print method:").pack(side="left")
+        ttk.Radiobutton(
+            eng, text="Chrome print dialog (kiosk)",
+            variable=self.var_engine, value="kiosk",
+        ).pack(side="left", padx=(4, 12))
+        ttk.Radiobutton(
+            eng, text="Direct PDF (hidden browser, exact size and scale)",
+            variable=self.var_engine, value="direct",
+        ).pack(side="left")
+
         checks = ttk.Frame(box)
-        checks.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+        checks.grid(row=6, column=0, columnspan=3, sticky="w", **pad)
         ttk.Checkbutton(checks, text="Use page title as file name", variable=self.var_use_title).pack(side="left", padx=(0, 20))
         ttk.Checkbutton(checks, text="Stop page loading before running steps", variable=self.var_stop_loading).pack(side="left", padx=(0, 20))
         ttk.Checkbutton(
@@ -645,6 +699,9 @@ class App(tk.Tk):
             "page_size": self.var_page_size.get(),
             "landscape": self.var_landscape.get(),
             "new_browser": self.var_browser_mode.get() == "each",
+            "engine": self.var_engine.get(),
+            "custom_w": num(self.var_custom_w, 210),
+            "custom_h": num(self.var_custom_h, 297),
         }
         self.stop_event.clear()
         self.btn_start.config(state="disabled")
@@ -672,8 +729,9 @@ class App(tk.Tk):
             "scalingType": 3,
             "scaling": str(cfg["scale"]),
         }
-        if cfg["page_size"] in PAGE_SIZES:
-            name, w, h = PAGE_SIZES[cfg["page_size"]]
+        dims = get_page_dims(cfg)
+        if dims:
+            name, w, h = dims
             settings["mediaSize"] = {
                 "name": name,
                 "width_microns": w,
@@ -749,8 +807,63 @@ class App(tk.Tk):
         except OSError:
             return set()
 
+    def make_direct_options(self):
+        options = webdriver.ChromeOptions()
+        options.page_load_strategy = "none"
+        options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
+        return options
+
     def new_driver(self, cfg):
+        if cfg["engine"] == "direct":
+            driver = webdriver.Chrome(service=make_service(cfg["driver"]), options=self.make_direct_options())
+            try:  # remove the "HeadlessChrome" marker that some sites block
+                ua = driver.execute_script("return navigator.userAgent")
+                driver.execute_cdp_cmd(
+                    "Network.setUserAgentOverride",
+                    {"userAgent": ua.replace("HeadlessChrome", "Chrome")},
+                )
+            except Exception:
+                pass
+            return driver
         return webdriver.Chrome(service=make_service(cfg["driver"]), options=self.make_options(cfg))
+
+    def print_direct(self, driver, cfg, filename):
+        """Save the page with Chrome's PDF engine: exact paper size and scale, no dialog."""
+        _name, w, h = get_page_dims(cfg) or PAGE_SIZES["A4"]
+        params = {
+            "landscape": cfg["landscape"],
+            "printBackground": True,
+            "displayHeaderFooter": False,
+            "scale": min(2.0, max(0.1, cfg["scale"] / 100.0)),
+            "paperWidth": w / 25400.0,   # microns -> inches
+            "paperHeight": h / 25400.0,
+        }
+        result = driver.execute_cdp_cmd("Page.printToPDF", params)
+        name = filename + ".pdf"
+        with open(os.path.join(cfg["folder"], name), "wb") as f:
+            f.write(base64.b64decode(result["data"]))
+        return name
+
+    @staticmethod
+    def describe_pdf(cfg, name):
+        """Read the real page size from the saved PDF and compare it with the selected size."""
+        size = pdf_page_size(os.path.join(cfg["folder"], name))
+        if not size:
+            return ""
+        w_pt, h_pt = size
+        text = f"  [{w_pt / 72 * 25.4:.0f} x {h_pt / 72 * 25.4:.0f} mm]"
+        dims = get_page_dims(cfg)
+        if dims:
+            _n, w, h = dims
+            exp_w, exp_h = w / 25400 * 72, h / 25400 * 72
+            if cfg["landscape"]:
+                exp_w, exp_h = exp_h, exp_w
+            if abs(exp_w - w_pt) < 3 and abs(exp_h - h_pt) < 3:
+                text += "  size OK"
+            else:
+                text += f"  SIZE DIFFERS from {cfg['page_size']}"
+        return text
 
     def wait_for_new_pdf(self, folder, before, timeout):
         """Wait for a new PDF to appear and finish writing. Returns its real file name."""
@@ -786,6 +899,10 @@ class App(tk.Tk):
         if os.path.exists(os.path.join(cfg["folder"], filename + ".pdf")):
             filename += f" {stamp}"  # avoid Chrome adding " (1)" to the name
 
+        if cfg["engine"] == "direct":
+            saved = self.print_direct(driver, cfg, filename)
+            return saved, driver.current_url
+
         before = self.pdf_names(cfg["folder"])
         driver.execute_script(f"document.title = {json.dumps(filename)};")
         driver.execute_script("window.print();")
@@ -817,7 +934,7 @@ class App(tk.Tk):
                             driver = self.new_driver(cfg)
                         saved, current_url = self.process_url(driver, i, link, cfg)
                         row = f"{link}\t{current_url}\t{saved}\t{datetime.datetime.now()}\n"
-                        q.put(("log", f"   saved: {saved}"))
+                        q.put(("log", f"   saved: {saved}{self.describe_pdf(cfg, saved)}"))
                     except Exception as e:
                         short = str(e).splitlines()[0] if str(e) else type(e).__name__
                         row = f"{link}\tError: {short}\tError\t{datetime.datetime.now()}\n"
