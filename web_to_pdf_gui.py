@@ -10,6 +10,7 @@ import datetime
 import threading
 import urllib.parse
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 
 from selenium import webdriver
@@ -17,6 +18,30 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException
+
+# Free Download Manager inspired palette
+NAVY = "#323A4E"        # dark toolbar
+NAVY_HOVER = "#414A62"
+BLUE = "#1EA5FF"        # accent
+BLUE_DARK = "#0E8EE6"
+BG = "#FFFFFF"
+TAB = "#EBEBEB"         # light grey "tabs" / buttons
+BORDER = "#D9D9D9"
+TEXT = "#2B2B2B"
+GREEN_BG = "#E3F4D7"    # status bar
+GREEN = "#62C93F"
+
+TEXT_OPTS = dict(
+    relief="flat", borderwidth=0, highlightthickness=1,
+    highlightbackground=BORDER, highlightcolor=BLUE,
+    bg="white", fg=TEXT, insertbackground=TEXT,
+    selectbackground=BLUE, selectforeground="white",
+)
+LIST_OPTS = dict(
+    relief="flat", borderwidth=0, highlightthickness=1,
+    highlightbackground=BORDER, highlightcolor=BLUE,
+    bg="white", fg=TEXT, selectbackground=BLUE, selectforeground="white",
+)
 
 
 # JavaScript injected into the recording browser. Every click is reported
@@ -208,8 +233,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Web Pages to PDF")
-        self.geometry("1020x910")
-        self.minsize(900, 830)
+        self.geometry("1020x780")
+        self.minsize(900, 640)
 
         self.msg_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -222,14 +247,14 @@ class App(tk.Tk):
         self.var_folder = tk.StringVar()
         self.var_driver = tk.StringVar()
         self.var_scale = tk.IntVar(value=100)
-        self.var_wait = tk.IntVar(value=20)
+        self.var_wait = tk.IntVar(value=5)
         self.var_load_wait = tk.IntVar(value=5)
-        self.var_use_title = tk.BooleanVar(value=True)
+        self.var_use_title = tk.BooleanVar(value=False)
         self.var_stop_loading = tk.BooleanVar(value=True)
         self.var_page_size = tk.StringVar(value="A4")
         self.var_landscape = tk.BooleanVar(value=False)
         self.var_dedupe = tk.BooleanVar(value=True)
-        self.var_browser_mode = tk.StringVar(value="each")
+        self.var_browser_mode = tk.StringVar(value="single")
         self.var_engine = tk.StringVar(value="direct")
         self.var_custom_w = tk.DoubleVar(value=210)
         self.var_custom_h = tk.DoubleVar(value=297)
@@ -244,11 +269,38 @@ class App(tk.Tk):
 
     # ---------------- UI ----------------
     def build_ui(self):
+        self.apply_theme()
         pad = {"padx": 8, "pady": 4}
 
-        # ----- Settings -----
-        box = ttk.LabelFrame(self, text="Settings")
-        box.pack(fill="x", padx=10, pady=8)
+        # ----- Toolbar (top) -----
+        self.toolbar = ttk.Frame(self, style="Toolbar.TFrame")
+        self.toolbar.pack(side="top", fill="x")
+        tb = ttk.Frame(self.toolbar, style="Toolbar.TFrame")
+        tb.pack(fill="x", padx=12, pady=10)
+        self.btn_start = ttk.Button(tb, text="\u25B6  Start", style="Accent.TButton", command=self.start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(tb, text="\u25A0  Stop", style="Toolbar.TButton", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(8, 0))
+        self.btn_test = ttk.Button(tb, text="Test on first link", style="Toolbar.TButton", command=self.test_first)
+        self.btn_test.pack(side="left", padx=(8, 0))
+        self.btn_options = ttk.Button(tb, text="", style="Toolbar.TButton", command=self.toggle_options)
+        self.btn_options.pack(side="right")
+
+        # ----- Status bar (bottom, always visible) -----
+        status_line = ttk.Frame(self, style="StatusLine.TFrame", height=4)
+        status_line.pack(side="bottom", fill="x")
+        status = ttk.Frame(self, style="Status.TFrame")
+        status.pack(side="bottom", fill="x")
+        self.lbl_summary = ttk.Label(status, text="", style="Status.TLabel")
+        self.lbl_summary.pack(side="left", padx=12, pady=8)
+        self.lbl_progress = ttk.Label(status, text="0 / 0", style="Status.TLabel")
+        self.lbl_progress.pack(side="right", padx=12)
+        self.progress = ttk.Progressbar(status, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        # ----- Options (collapsed by default, toggled from the toolbar) -----
+        box = ttk.LabelFrame(self, text="Options")
+        self.opt_box = box
         box.columnconfigure(1, weight=1)
 
         ttk.Label(box, text="Save folder:").grid(row=0, column=0, sticky="w", **pad)
@@ -323,7 +375,7 @@ class App(tk.Tk):
 
         links = ttk.LabelFrame(mid, text="Links (one per line)")
         links.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        self.txt_links = scrolledtext.ScrolledText(links, height=10, width=40, wrap="none")
+        self.txt_links = scrolledtext.ScrolledText(links, height=10, width=40, wrap="none", **TEXT_OPTS)
         self.txt_links.pack(fill="both", expand=True, padx=6, pady=6)
         bar = ttk.Frame(links)
         bar.pack(fill="x", padx=6, pady=(0, 6))
@@ -340,7 +392,7 @@ class App(tk.Tk):
         lf.pack(fill="both", expand=True, padx=6, pady=(6, 2))
         lf.rowconfigure(0, weight=1)
         lf.columnconfigure(0, weight=1)
-        self.lst_steps = tk.Listbox(lf, height=8, activestyle="dotbox", exportselection=False)
+        self.lst_steps = tk.Listbox(lf, height=8, activestyle="none", exportselection=False, **LIST_OPTS)
         self.lst_steps.grid(row=0, column=0, sticky="nsew")
         sy = ttk.Scrollbar(lf, orient="vertical", command=self.lst_steps.yview)
         sy.grid(row=0, column=1, sticky="ns")
@@ -374,25 +426,116 @@ class App(tk.Tk):
         ttk.Spinbox(sg, from_=0, to=120, increment=0.5, width=6, textvariable=self.var_after_steps).grid(row=1, column=1, padx=(4, 12), pady=(4, 0))
         ttk.Checkbutton(sg, text="Continue if an element is not found", variable=self.var_continue).grid(row=1, column=2, columnspan=2, sticky="w", pady=(4, 0))
 
-        # ----- Controls -----
-        ctrl = ttk.Frame(self)
-        ctrl.pack(fill="x", padx=10, pady=6)
-        self.btn_start = ttk.Button(ctrl, text="\u25B6 Start", command=self.start)
-        self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(ctrl, text="\u25A0 Stop", command=self.stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=6)
-        self.btn_test = ttk.Button(ctrl, text="Test on first link", command=self.test_first)
-        self.btn_test.pack(side="left")
-        self.progress = ttk.Progressbar(ctrl, mode="determinate")
-        self.progress.pack(side="left", fill="x", expand=True, padx=10)
-        self.lbl_progress = ttk.Label(ctrl, text="0 / 0")
-        self.lbl_progress.pack(side="left")
-
         # ----- Log -----
         logf = ttk.LabelFrame(self, text="Log")
         logf.pack(fill="both", expand=True, padx=10, pady=(4, 10))
-        self.txt_log = scrolledtext.ScrolledText(logf, height=9, state="disabled")
+        self.txt_log = scrolledtext.ScrolledText(logf, height=7, state="disabled", **TEXT_OPTS)
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
+
+        for v in (self.var_page_size, self.var_landscape, self.var_scale, self.var_engine,
+                  self.var_browser_mode, self.var_custom_w, self.var_custom_h):
+            v.trace_add("write", self.update_summary)
+        self.update_summary()
+        self.set_options(False)
+
+    # ---------------- theme and options panel ----------------
+    def apply_theme(self):
+        self.configure(bg=BG)
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(name).configure(family="Segoe UI", size=10)
+            except tk.TclError:
+                pass
+
+        self.option_add("*TCombobox*Listbox.background", "white")
+        self.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", BLUE)
+        self.option_add("*TCombobox*Listbox.selectForeground", "white")
+
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure(".", background=BG, foreground=TEXT, fieldbackground=BG, bordercolor=BORDER,
+                    lightcolor=BG, darkcolor=BG, troughcolor="#F0F0F0", focuscolor=BG)
+        s.configure("TFrame", background=BG)
+        s.configure("TLabel", background=BG, foreground=TEXT)
+        s.configure("TLabelframe", background=BG, bordercolor=BORDER, lightcolor=BG,
+                    darkcolor=BG, relief="solid", borderwidth=1)
+        s.configure("TLabelframe.Label", background=BG, foreground="#4A4A4A",
+                    font=("Segoe UI", 10, "bold"))
+
+        def flat_button(name, bg, fg, hover, pressed, dis_bg, dis_fg, padding, bold=False):
+            s.configure(name, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg,
+                        darkcolor=bg, focuscolor=bg, padding=padding, relief="flat", borderwidth=1)
+            if bold:
+                s.configure(name, font=("Segoe UI", 10, "bold"))
+            states = [("disabled", dis_bg), ("pressed", pressed), ("active", hover)]
+            s.map(name, background=states, bordercolor=states, lightcolor=states, darkcolor=states,
+                  foreground=[("disabled", dis_fg)])
+
+        flat_button("TButton", TAB, "#333333", "#DDDDDD", "#D0D0D0", "#F4F4F4", "#A8A8A8", (10, 5))
+        flat_button("Accent.TButton", BLUE, "white", BLUE_DARK, "#0A7DCC", "#A8D9FB", "white", (18, 8), bold=True)
+        flat_button("Toolbar.TButton", NAVY, "#E6EAF2", NAVY_HOVER, "#2A3142", NAVY, "#7A859B", (12, 8))
+
+        for w in ("TEntry", "TSpinbox", "TCombobox"):
+            s.configure(w, fieldbackground="white", foreground=TEXT, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, padding=4, arrowcolor="#5A6478")
+            s.map(w, bordercolor=[("focus", BLUE)], lightcolor=[("focus", BLUE)],
+                  darkcolor=[("focus", BLUE)])
+        s.configure("TSpinbox", background="#F3F3F3")
+        s.configure("TCombobox", background="#F3F3F3")
+        s.map("TCombobox", fieldbackground=[("readonly", "white")],
+              foreground=[("readonly", TEXT)],
+              selectbackground=[("readonly", "white")],
+              selectforeground=[("readonly", TEXT)])
+
+        for w in ("TCheckbutton", "TRadiobutton"):
+            s.configure(w, background=BG, foreground=TEXT, indicatorbackground="white",
+                        indicatorforeground="white", upperbordercolor="#B5BCC8",
+                        lowerbordercolor="#B5BCC8")
+            s.map(w, background=[("active", BG)],
+                  indicatorbackground=[("selected", BLUE), ("pressed", "#CFE9FD")],
+                  indicatorforeground=[("selected", "white")],
+                  upperbordercolor=[("selected", BLUE)], lowerbordercolor=[("selected", BLUE)])
+
+        s.configure("Horizontal.TProgressbar", troughcolor="#D5DBE4", background=BLUE,
+                    bordercolor="#D5DBE4", lightcolor=BLUE, darkcolor=BLUE, thickness=10)
+        s.configure("TScrollbar", background="#C5CBD5", troughcolor="#F3F3F3", bordercolor="#F3F3F3",
+                    arrowcolor="#5A6478", lightcolor="#C5CBD5", darkcolor="#C5CBD5")
+        s.map("TScrollbar", background=[("active", "#AEB6C3")])
+
+        s.configure("Toolbar.TFrame", background=NAVY)
+        s.configure("Status.TFrame", background=GREEN_BG)
+        s.configure("StatusLine.TFrame", background=GREEN)
+        s.configure("Status.TLabel", background=GREEN_BG, foreground="#34502A")
+
+    def toggle_options(self):
+        self.set_options(not self.opt_visible)
+
+    def set_options(self, show):
+        self.opt_visible = show
+        if show:
+            self.opt_box.pack(fill="x", padx=10, pady=(8, 0), after=self.toolbar)
+        else:
+            self.opt_box.pack_forget()
+        arrow = "\u25BE" if show else "\u25B8"
+        self.btn_options.config(text=f"\u2630  Options  {arrow}")
+
+    def update_summary(self, *_):
+        size = self.var_page_size.get()
+        direct = self.var_engine.get() == "direct"
+        if size == CUSTOM_SIZE:
+            size = f"{num(self.var_custom_w, 0):g} x {num(self.var_custom_h, 0):g} mm"
+        elif size == "Browser default" and direct:
+            size = "A4"
+        if self.var_landscape.get():
+            size += " landscape"
+        parts = [
+            size,
+            f"{num(self.var_scale, 100)}%",
+            "Direct PDF" if direct else "Print dialog",
+            "one browser" if self.var_browser_mode.get() == "single" else "browser per URL",
+        ]
+        self.lbl_summary.config(text="   \u00B7   ".join(parts))
 
     # ---------------- helpers ----------------
     def update_link_count(self):
@@ -536,6 +679,7 @@ class App(tk.Tk):
         dlg = tk.Toplevel(self)
         dlg.title("Add click step")
         dlg.transient(self)
+        dlg.configure(bg=BG)
         dlg.resizable(False, False)
 
         var = tk.StringVar()
@@ -689,7 +833,8 @@ class App(tk.Tk):
         folder = self.var_folder.get().strip()
         links = self.get_links()
         if not folder:
-            messagebox.showwarning("Warning", "Choose a save folder first.")
+            self.set_options(True)
+            messagebox.showwarning("Warning", "Choose a save folder first (Options panel).")
             return None
         if not os.path.isdir(folder):
             try:
