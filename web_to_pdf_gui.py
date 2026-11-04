@@ -9,6 +9,7 @@ import random
 import queue
 import datetime
 import threading
+import zipfile
 import urllib.parse
 import tkinter as tk
 import tkinter.font as tkfont
@@ -259,6 +260,275 @@ def num(var, default):
         return default
 
 
+# ===== pure-logic helpers (no Tk / Selenium needed) =====
+ALL_SITES = "*"
+ALL_SITES_LABEL = "All sites (default)"
+STATUS_HEADER = ["Link", "Page Link", "Filename", "Date&Time", "Status", "Notes"]
+
+
+class BlockedPage(Exception):
+    """The page looks like an error, access-denied or bot-check page."""
+
+
+COMMON_HIDE = """\
+#onetrust-consent-sdk
+#onetrust-banner-sdk
+#CybotCookiebotDialog
+#cookie-law-info-bar
+.cc-window
+.cookie-banner
+.cookie-notice
+.cookie-consent
+[id*="cookie-banner" i]
+[class*="cookie-banner" i]
+[id*="cookiebanner" i]
+[class*="cookiebanner" i]
+[class*="consent-banner" i]
+#hubspot-messages-iframe-container
+#intercom-container
+.intercom-lightweight-app
+.drift-frame-controller
+iframe#launcher
+#tidio-chat
+.tawk-min-container
+.zopim
+"""
+
+# JavaScript run in the page before saving
+HIDE_JS = r"""
+var sels = arguments[0], unstick = arguments[1];
+var st = document.createElement('style');
+st.setAttribute('data-webtopdf', '1');
+st.textContent = sels.map(function (s) { return s + ' { display: none !important; }'; }).join('\n');
+(document.head || document.documentElement).appendChild(st);
+if (unstick) {
+  var all = document.querySelectorAll('body *');
+  for (var i = 0; i < all.length; i++) {
+    var pos = getComputedStyle(all[i]).position;
+    if (pos === 'fixed' || pos === 'sticky') all[i].style.setProperty('position', 'static', 'important');
+  }
+}
+"""
+
+DETECT_JS = r"""
+var n = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+var text = (document.body && document.body.innerText) || '';
+return {
+  status: (n && n.responseStatus) ? n.responseStatus : 0,
+  title: document.title || '',
+  text: text.slice(0, 2000),
+  length: text.length
+};
+"""
+
+BLOCK_TITLES = (
+    "access denied", "403 forbidden", "error 403", "forbidden", "just a moment",
+    "attention required", "are you a robot", "robot check", "security check", "captcha",
+    "you have been blocked", "404 not found", "error 404", "page not found",
+    "service unavailable", "too many requests", "request blocked",
+)
+BLOCK_TEXTS = (
+    "access denied", "verify you are human", "unusual traffic", "captcha", "request blocked",
+    "you have been blocked", "checking your browser", "enable javascript and cookies to continue",
+    "403 forbidden", "404 not found", "page not found", "too many requests",
+    "can't be reached", "can\u2019t be reached", "err_name_not_resolved", "err_connection",
+    "err_timed_out", "err_ssl", "err_cert",
+)
+
+
+def classify_page(info):
+    """Return a short reason if the loaded page looks blocked / broken, otherwise None."""
+    if not isinstance(info, dict):
+        return None
+    status = info.get("status") or 0
+    if status >= 400:
+        return f"HTTP {status}"
+    raw_title = info.get("title") or ""
+    title = raw_title.lower()
+    text = (info.get("text") or "").lower()
+    length = info.get("length") or 0
+    for p in BLOCK_TITLES:
+        if p in title:
+            return f'page title "{raw_title[:60]}"'
+    if length < 1500:
+        for p in BLOCK_TEXTS:
+            if p in text:
+                return f'page says "{p}"'
+        if length == 0 and not raw_title.strip():
+            return "blank page (nothing loaded)"
+    return None
+
+
+def detect_blocked(driver):
+    try:
+        return classify_page(driver.execute_script(DETECT_JS))
+    except Exception:
+        return None
+
+
+def parse_hide_list(text):
+    out = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("//") or "{" in s or "}" in s:
+            continue
+        out.append(s)
+    return out
+
+
+def settings_file():
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "WebToPDF", "settings.json")
+
+
+def host_of(url):
+    try:
+        h = urllib.parse.urlparse(url if "//" in url else "//" + url).hostname or ""
+    except ValueError:
+        h = ""
+    h = h.lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def host_matches(host, key):
+    key = (key or "").lower()
+    if key.startswith("www."):
+        key = key[4:]
+    return bool(key) and (host == key or host.endswith("." + key))
+
+
+def valid_step(s):
+    return isinstance(s, dict) and (
+        (s.get("type") == "click" and s.get("selector"))
+        or (s.get("type") == "wait" and isinstance(s.get("seconds"), (int, float)))
+    )
+
+
+def steps_for_url(step_sets, url):
+    """A site's own steps (if it has any) replace the 'All sites' steps."""
+    host = host_of(url)
+    best = None
+    for key in step_sets:
+        if key != ALL_SITES and host_matches(host, key):
+            if best is None or len(key) > len(best):
+                best = key
+    if best is not None and step_sets[best]:
+        return step_sets[best]
+    return step_sets.get(ALL_SITES, [])
+
+
+def tsv(row):
+    return "\t".join(re.sub(r"[\t\r\n]+", " ", str(x)) for x in row) + "\n"
+
+
+def load_status(path):
+    """Read the report (new or older format) as rows of 6 columns."""
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return rows
+    for n, line in enumerate(lines):
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if n == 0 and parts[0].strip().lower() == "link":
+            continue
+        parts += [""] * (6 - len(parts))
+        link, page, fname, when, status, notes = parts[:6]
+        if not status:
+            failed = fname.strip() == "Error" or page.startswith("Error")
+            status = "Error" if failed else "OK"
+            if failed and page.startswith("Error"):
+                notes = notes or page[5:].lstrip(": ").strip()
+                page = ""
+        rows.append([link, page, fname, when, status, notes])
+    return rows
+
+
+def write_status(path, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\t".join(STATUS_HEADER) + "\n")
+        for r in rows:
+            f.write(tsv(r))
+
+
+def xml_escape(text):
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(text))
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def col_letter(n):
+    s, n = "", n + 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def write_xlsx(path, rows, widths=(60, 60, 45, 22, 10, 50)):
+    """Write a simple .xlsx file (no extra libraries needed)."""
+    head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    ns_pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    sheet = [head, f'<worksheet xmlns="{ns_main}">',
+             '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+             'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>',
+             "<cols>" + "".join(
+                 f'<col min="{i}" max="{i}" width="{w}" customWidth="1"/>'
+                 for i, w in enumerate(widths, 1)) + "</cols>",
+             "<sheetData>"]
+    for r, row in enumerate(rows, 1):
+        style = ' s="1"' if r == 1 else ""
+        cells = "".join(
+            f'<c r="{col_letter(c)}{r}" t="inlineStr"{style}>'
+            f'<is><t xml:space="preserve">{xml_escape(v)}</t></is></c>'
+            for c, v in enumerate(row)
+        )
+        sheet.append(f'<row r="{r}">{cells}</row>')
+    last_col = col_letter(max(len(rows[0]) if rows else 1, 1) - 1)
+    sheet.append(f'</sheetData><autoFilter ref="A1:{last_col}{max(len(rows), 1)}"/></worksheet>')
+
+    parts = {
+        "[Content_Types].xml": head
+        + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        "</Types>",
+        "_rels/.rels": head + f'<Relationships xmlns="{ns_pkg}">'
+        f'<Relationship Id="rId1" Type="{ns_rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+        "xl/workbook.xml": head + f'<workbook xmlns="{ns_main}" xmlns:r="{ns_rel}">'
+        '<sheets><sheet name="Report" sheetId="1" r:id="rId1"/></sheets></workbook>',
+        "xl/_rels/workbook.xml.rels": head + f'<Relationships xmlns="{ns_pkg}">'
+        f'<Relationship Id="rId1" Type="{ns_rel}/worksheet" Target="worksheets/sheet1.xml"/>'
+        f'<Relationship Id="rId2" Type="{ns_rel}/styles" Target="styles.xml"/></Relationships>',
+        "xl/styles.xml": head + f'<styleSheet xmlns="{ns_main}">'
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        "</styleSheet>",
+        "xl/worksheets/sheet1.xml": "".join(sheet),
+    }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, content in parts.items():
+            z.writestr(name, content)
+
+
+# ===== end of pure-logic helpers =====
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -272,7 +542,13 @@ class App(tk.Tk):
         self.worker = None
         self.recording = False
         self.rec_driver = None
-        self.steps = []
+        self.live_drivers = set()
+        self.opt_visible = False
+        self.step_sets = {ALL_SITES: []}
+        self.current_set = ALL_SITES
+        self.hide_text = ""
+        self.saved_links = ""
+        self._drag_idx = None
 
         self.var_folder = tk.StringVar()
         self.var_driver = tk.StringVar()
@@ -294,10 +570,94 @@ class App(tk.Tk):
         self.var_step_delay = tk.DoubleVar(value=1)
         self.var_after_steps = tk.DoubleVar(value=2)
         self.var_continue = tk.BooleanVar(value=True)
+        self.var_retries = tk.IntVar(value=2)
+        self.var_workers = tk.IntVar(value=1)
+        self.var_resume = tk.BooleanVar(value=True)
+        self.var_detect = tk.BooleanVar(value=True)
+        self.var_unstick = tk.BooleanVar(value=False)
+
+        # Everything here is remembered between runs
+        self.persist = {
+            "folder": self.var_folder, "driver": self.var_driver, "scale": self.var_scale,
+            "wait": self.var_wait, "load_wait": self.var_load_wait, "use_title": self.var_use_title,
+            "stop_loading": self.var_stop_loading, "page_size": self.var_page_size,
+            "landscape": self.var_landscape, "dedupe": self.var_dedupe,
+            "browser_mode": self.var_browser_mode, "engine": self.var_engine,
+            "custom_w": self.var_custom_w, "custom_h": self.var_custom_h,
+            "stealth": self.var_stealth, "url_delay": self.var_url_delay,
+            "step_timeout": self.var_step_timeout, "step_delay": self.var_step_delay,
+            "after_steps": self.var_after_steps, "continue": self.var_continue,
+            "retries": self.var_retries, "workers": self.var_workers,
+            "resume": self.var_resume, "detect": self.var_detect, "unstick": self.var_unstick,
+        }
+        self.load_settings()
 
         self.build_ui()
+        if self.saved_links:
+            self.txt_links.insert("1.0", self.saved_links)
+            self.update_link_count()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self.poll_queue)
+
+    # The steps list shown in the UI is the one of the selected site
+    @property
+    def steps(self):
+        return self.step_sets.setdefault(self.current_set, [])
+
+    @steps.setter
+    def steps(self, value):
+        self.step_sets[self.current_set] = value
+
+    # ---------------- saved settings ----------------
+    def load_settings(self):
+        try:
+            with open(settings_file(), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        for key, var in self.persist.items():
+            if key in data:
+                try:
+                    var.set(data[key])
+                except (tk.TclError, ValueError, TypeError):
+                    pass
+        sets = data.get("step_sets")
+        if isinstance(sets, dict):
+            clean = {k: [s for s in v if valid_step(s)] for k, v in sets.items() if isinstance(v, list)}
+            clean.setdefault(ALL_SITES, [])
+            self.step_sets = clean
+            if data.get("current_set") in clean:
+                self.current_set = data["current_set"]
+        if isinstance(data.get("hide_text"), str):
+            self.hide_text = data["hide_text"]
+        if isinstance(data.get("links"), str):
+            self.saved_links = data["links"]
+        size = data.get("size")
+        if isinstance(size, str) and re.fullmatch(r"\d{3,4}x\d{3,4}", size):
+            self.geometry(size)
+
+    def save_settings(self):
+        data = {}
+        for key, var in self.persist.items():
+            try:
+                data[key] = var.get()
+            except tk.TclError:
+                pass
+        data["step_sets"] = self.step_sets
+        data["current_set"] = self.current_set
+        data["hide_text"] = self.hide_text
+        data["links"] = self.txt_links.get("1.0", "end").strip()
+        if self.winfo_width() > 600 and self.winfo_height() > 400:
+            data["size"] = f"{self.winfo_width()}x{self.winfo_height()}"
+        try:
+            path = settings_file()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
 
     # ---------------- UI ----------------
     def build_ui(self):
@@ -317,6 +677,10 @@ class App(tk.Tk):
         self.btn_test.pack(side="left", padx=(8, 0))
         self.btn_options = ttk.Button(tb, text="", style="Toolbar.TButton", command=self.toggle_options)
         self.btn_options.pack(side="right")
+        self.btn_export = ttk.Button(tb, text="Export Excel", style="Toolbar.TButton", command=self.export_excel)
+        self.btn_export.pack(side="right", padx=(0, 8))
+        self.btn_folder = ttk.Button(tb, text="Open folder", style="Toolbar.TButton", command=self.open_folder)
+        self.btn_folder.pack(side="right", padx=(0, 8))
 
         # ----- Status bar (bottom, always visible) -----
         status_line = ttk.Frame(self, style="StatusLine.TFrame", height=4)
@@ -391,8 +755,15 @@ class App(tk.Tk):
             variable=self.var_engine, value="kiosk",
         ).pack(side="left")
 
+        rel = ttk.Frame(box)
+        rel.grid(row=6, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(rel, text="Retries per link:").pack(side="left")
+        ttk.Spinbox(rel, from_=0, to=10, width=5, textvariable=self.var_retries).pack(side="left", padx=(4, 16))
+        ttk.Label(rel, text="Parallel browsers (Direct PDF only, 1-4):").pack(side="left")
+        ttk.Spinbox(rel, from_=1, to=4, width=5, textvariable=self.var_workers).pack(side="left", padx=(4, 0))
+
         checks = ttk.Frame(box)
-        checks.grid(row=6, column=0, columnspan=3, sticky="w", **pad)
+        checks.grid(row=7, column=0, columnspan=3, sticky="w", **pad)
         ttk.Checkbutton(checks, text="Use page title as file name", variable=self.var_use_title).pack(side="left", padx=(0, 20))
         ttk.Checkbutton(checks, text="Stop page loading before running steps", variable=self.var_stop_loading).pack(side="left", padx=(0, 20))
         ttk.Checkbutton(
@@ -402,6 +773,12 @@ class App(tk.Tk):
         ttk.Checkbutton(
             checks, text="Stealth mode (reduce automation signals)", variable=self.var_stealth,
         ).pack(side="left")
+
+        ex = ttk.Frame(box)
+        ex.grid(row=8, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Checkbutton(ex, text="Skip links already saved (resume)", variable=self.var_resume).pack(side="left", padx=(0, 20))
+        ttk.Checkbutton(ex, text="Detect blocked / error pages", variable=self.var_detect).pack(side="left", padx=(0, 20))
+        ttk.Button(ex, text="Hide elements...", command=self.edit_hide).pack(side="left")
 
         # ----- Links | Steps | Log  (drag the dividers to resize) -----
         pane_opts = dict(sashwidth=8, sashrelief="flat", bg="#E9ECF1", bd=0, opaqueresize=True)
@@ -425,6 +802,19 @@ class App(tk.Tk):
         steps = ttk.LabelFrame(mid, text="Steps run on every link before saving")
         mid.add(steps, stretch="always", minsize=410)
 
+        sr = ttk.Frame(steps)
+        sr.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Label(sr, text="Steps for:").pack(side="left")
+        self.cmb_set = ttk.Combobox(sr, state="readonly", width=24)
+        self.cmb_set.pack(side="left", padx=(4, 6))
+        self.cmb_set.bind("<<ComboboxSelected>>", self.on_set_selected)
+        ttk.Button(sr, text="New site...", command=self.add_site).pack(side="left")
+        ttk.Button(sr, text="Delete site", command=self.delete_site).pack(side="left", padx=4)
+        ttk.Label(
+            steps, text="A site's own steps replace the 'All sites' steps for that site.",
+            foreground="#8A94A6",
+        ).pack(anchor="w", padx=8, pady=(2, 0))
+
         lf = ttk.Frame(steps)
         lf.pack(fill="both", expand=True, padx=6, pady=(6, 2))
         lf.rowconfigure(0, weight=1)
@@ -436,6 +826,10 @@ class App(tk.Tk):
         sx = ttk.Scrollbar(lf, orient="horizontal", command=self.lst_steps.xview)
         sx.grid(row=1, column=0, sticky="ew")
         self.lst_steps.config(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        # drag a step up or down to reorder it
+        self.lst_steps.bind("<Button-1>", self.on_step_press, add="+")
+        self.lst_steps.bind("<B1-Motion>", self.on_step_drag)
+        self.lst_steps.bind("<ButtonRelease-1>", self.on_step_release, add="+")
 
         r1 = ttk.Frame(steps)
         r1.pack(fill="x", padx=6, pady=2)
@@ -470,9 +864,12 @@ class App(tk.Tk):
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
 
         for v in (self.var_page_size, self.var_landscape, self.var_scale, self.var_engine,
-                  self.var_browser_mode, self.var_custom_w, self.var_custom_h, self.var_stealth):
+                  self.var_browser_mode, self.var_custom_w, self.var_custom_h, self.var_stealth,
+                  self.var_workers):
             v.trace_add("write", self.update_summary)
         self.update_summary()
+        self.refresh_sets()
+        self.refresh_steps()
         self.set_options(False)
 
     # ---------------- theme and options panel ----------------
@@ -572,6 +969,9 @@ class App(tk.Tk):
             "Direct PDF" if direct else "Print dialog",
             "one browser" if self.var_browser_mode.get() == "single" else "browser per URL",
         ]
+        workers = num(self.var_workers, 1)
+        if direct and workers > 1:
+            parts.append(f"{workers} parallel")
         if self.var_stealth.get():
             parts.append("stealth")
         self.lbl_summary.config(text="   \u00B7   ".join(parts))
@@ -620,6 +1020,69 @@ class App(tk.Tk):
                 self.txt_links.delete("1.0", "end")
                 self.txt_links.insert("1.0", fh.read())
 
+    def open_folder(self):
+        folder = self.var_folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showinfo("Open folder", "Choose an existing save folder first (Options panel).")
+            self.set_options(True)
+            return
+        open_file(folder)
+
+    def export_excel(self):
+        folder = self.var_folder.get().strip()
+        status_path = os.path.join(folder, "Output Status.txt") if folder else ""
+        if not status_path or not os.path.exists(status_path):
+            messagebox.showinfo("Export Excel", "No report found yet in the save folder.")
+            return
+        rows = load_status(status_path)
+        if not rows:
+            messagebox.showinfo("Export Excel", "The report is empty.")
+            return
+        path = os.path.join(folder, "Report.xlsx")
+        try:
+            write_xlsx(path, [STATUS_HEADER] + rows)
+        except OSError as e:
+            messagebox.showerror("Export Excel", f"Could not write Report.xlsx.\nClose it in Excel and try again.\n\n{e}")
+            return
+        self.log(f"Report exported: {path}")
+        open_file(path)
+
+    def edit_hide(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Hide elements before saving")
+        dlg.transient(self)
+        dlg.configure(bg=BG)
+        ttk.Label(
+            dlg, text="CSS selectors to hide, one per line (cookie banners, chat widgets, sticky headers...):",
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+        txt = scrolledtext.ScrolledText(dlg, width=72, height=14, **TEXT_OPTS)
+        txt.pack(fill="both", expand=True, padx=10)
+        txt.insert("1.0", self.hide_text)
+        ttk.Checkbutton(
+            dlg, text="Also un-stick fixed / sticky elements (floating headers and bars)",
+            variable=self.var_unstick,
+        ).pack(anchor="w", padx=10, pady=(8, 0))
+
+        def insert_common():
+            current = txt.get("1.0", "end").strip()
+            have = set(parse_hide_list(current))
+            add = [s for s in parse_hide_list(COMMON_HIDE) if s not in have]
+            if add:
+                txt.insert("end", ("\n" if current else "") + "\n".join(add) + "\n")
+
+        def ok():
+            self.hide_text = txt.get("1.0", "end").strip()
+            dlg.destroy()
+            n = len(parse_hide_list(self.hide_text))
+            self.log(f"Hide list updated: {n} selector(s).")
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text="Insert common selectors", command=insert_common).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right")
+        ttk.Button(btns, text="OK", command=ok).pack(side="right", padx=6)
+        dlg.grab_set()
+
     def log(self, text):
         self.txt_log.config(state="normal")
         self.txt_log.insert("end", text + "\n")
@@ -657,15 +1120,52 @@ class App(tk.Tk):
         self.after(100, self.poll_queue)
 
     def on_close(self):
+        self.save_settings()
         self.rec_stop.set()
         self.stop_event.set()
-        d = self.rec_driver
-        if d is not None:
-            try:
-                d.quit()
-            except Exception:
-                pass
+        for d in list(self.live_drivers) + [self.rec_driver]:
+            if d is not None:
+                try:
+                    d.quit()
+                except Exception:
+                    pass
         self.destroy()
+
+    # ---------------- sites (steps per domain) ----------------
+    def refresh_sets(self):
+        keys = [ALL_SITES] + sorted(k for k in self.step_sets if k != ALL_SITES)
+        self.cmb_set.config(values=[ALL_SITES_LABEL if k == ALL_SITES else k for k in keys])
+        self.cmb_set.set(ALL_SITES_LABEL if self.current_set == ALL_SITES else self.current_set)
+
+    def on_set_selected(self, _event=None):
+        label = self.cmb_set.get()
+        self.current_set = ALL_SITES if label == ALL_SITES_LABEL else label
+        self.refresh_steps()
+
+    def add_site(self):
+        links = self.get_links()
+        first = host_of(links[0]) if links else ""
+        text = simpledialog.askstring(
+            "New site", "Domain that gets its own steps (for example jst.co.uk):",
+            initialvalue=first, parent=self,
+        )
+        host = host_of(text.strip()) if text else ""
+        if not host:
+            return
+        self.step_sets.setdefault(host, [])
+        self.current_set = host
+        self.refresh_sets()
+        self.refresh_steps()
+
+    def delete_site(self):
+        if self.current_set == ALL_SITES:
+            messagebox.showinfo("Delete site", "The 'All sites' set can't be deleted. Use 'Clear all' to empty it.")
+            return
+        if messagebox.askyesno("Delete site", f"Delete the steps of {self.current_set}?"):
+            self.step_sets.pop(self.current_set, None)
+            self.current_set = ALL_SITES
+            self.refresh_sets()
+            self.refresh_steps()
 
     # ---------------- steps list ----------------
     def step_text(self, n, st):
@@ -687,6 +1187,23 @@ class App(tk.Tk):
         sel = self.lst_steps.curselection()
         return sel[0] if sel else None
 
+    def on_step_press(self, event):
+        self._drag_idx = self.lst_steps.nearest(event.y) if self.steps else None
+
+    def on_step_drag(self, event):
+        i = self._drag_idx
+        if i is None or not self.steps:
+            return "break"
+        j = max(0, min(self.lst_steps.nearest(event.y), len(self.steps) - 1))
+        if j != i:
+            self.steps.insert(j, self.steps.pop(i))
+            self._drag_idx = j
+            self.refresh_steps(select=j)
+        return "break"
+
+    def on_step_release(self, _event):
+        self._drag_idx = None
+
     def delete_step(self):
         i = self.selected_index()
         if i is None:
@@ -704,7 +1221,7 @@ class App(tk.Tk):
             self.refresh_steps(select=j)
 
     def clear_steps(self):
-        if self.steps and messagebox.askyesno("Clear steps", "Remove all steps?"):
+        if self.steps and messagebox.askyesno("Clear steps", "Remove all steps in this list?"):
             self.steps = []
             self.refresh_steps()
 
@@ -754,7 +1271,7 @@ class App(tk.Tk):
 
     def save_steps(self):
         if not self.steps:
-            messagebox.showinfo("Save steps", "There are no steps to save.")
+            messagebox.showinfo("Save steps", "There are no steps to save in this list.")
             return
         f = filedialog.asksaveasfilename(
             title="Save steps", defaultextension=".json", filetypes=[("JSON", "*.json")]
@@ -770,15 +1287,7 @@ class App(tk.Tk):
         try:
             with open(f, encoding="utf-8") as fh:
                 data = json.load(fh)
-            ok = isinstance(data, list) and all(
-                isinstance(s, dict)
-                and (
-                    (s.get("type") == "click" and s.get("selector"))
-                    or (s.get("type") == "wait" and isinstance(s.get("seconds"), (int, float)))
-                )
-                for s in data
-            )
-            if not ok:
+            if not (isinstance(data, list) and all(valid_step(s) for s in data)):
                 raise ValueError("Invalid steps file.")
         except Exception as e:
             messagebox.showerror("Load steps", f"Could not load steps:\n{e}")
@@ -795,9 +1304,16 @@ class App(tk.Tk):
             return
 
         links = self.get_links()
-        url = links[0] if links else simpledialog.askstring(
-            "Record clicks", "Enter a sample page URL to open:", parent=self
-        )
+        if self.current_set == ALL_SITES:
+            url = links[0] if links else None
+            hint = ""
+        else:
+            url = next((l for l in links if host_matches(host_of(l), self.current_set)), None)
+            hint = "https://" + self.current_set
+        if not url:
+            url = simpledialog.askstring(
+                "Record clicks", "Enter a sample page URL to open:", initialvalue=hint, parent=self
+            )
         if not url:
             return
         url = url.strip()
@@ -809,7 +1325,8 @@ class App(tk.Tk):
         self.btn_record.config(text="\u25A0 Stop recording")
         self.btn_start.config(state="disabled")
         self.btn_test.config(state="disabled")
-        self.log("Recording started. Click the elements you want in the browser window, "
+        target = "All sites" if self.current_set == ALL_SITES else self.current_set
+        self.log(f"Recording for: {target}. Click the elements you want in the browser window, "
                  "in order, then press 'Stop recording' here.")
         threading.Thread(
             target=self.record_worker,
@@ -903,7 +1420,7 @@ class App(tk.Tk):
             "step_delay": num(self.var_step_delay, 1),
             "after_steps": num(self.var_after_steps, 2),
             "continue_missing": self.var_continue.get(),
-            "steps": json.loads(json.dumps(self.steps)),
+            "step_sets": json.loads(json.dumps(self.step_sets)),
             "page_size": self.var_page_size.get(),
             "landscape": self.var_landscape.get(),
             "new_browser": self.var_browser_mode.get() == "each",
@@ -912,6 +1429,13 @@ class App(tk.Tk):
             "custom_h": num(self.var_custom_h, 297),
             "stealth": self.var_stealth.get(),
             "url_delay": num(self.var_url_delay, 0),
+            "retries": max(0, num(self.var_retries, 2)),
+            "retry_delay": 3,
+            "workers": max(1, min(4, num(self.var_workers, 1))),
+            "resume": self.var_resume.get(),
+            "detect": self.var_detect.get(),
+            "hide": parse_hide_list(self.hide_text),
+            "unstick": self.var_unstick.get(),
         }
         return links, cfg
 
@@ -923,6 +1447,7 @@ class App(tk.Tk):
         if not built:
             return
         links, cfg = built
+        self.save_settings()
 
         self.stop_event.clear()
         self.btn_start.config(state="disabled")
@@ -947,6 +1472,7 @@ class App(tk.Tk):
         if not built:
             return
         links, cfg = built
+        self.save_settings()
 
         test_folder = os.path.join(cfg["folder"], "_test")
         try:
@@ -973,9 +1499,10 @@ class App(tk.Tk):
             size = "A4 (default)"
         orient = "landscape" if cfg["landscape"] else "portrait"
         method = "Direct PDF" if direct else "Chrome print dialog"
+        n_steps = len(steps_for_url(cfg["step_sets"], link))
 
         q.put(("log", f"TEST on first link: {link}"))
-        q.put(("log", f"   settings: {size}, {orient}, scale {cfg['scale']}%, {method}, {len(cfg['steps'])} step(s)"))
+        q.put(("log", f"   settings: {size}, {orient}, scale {cfg['scale']}%, {method}, {n_steps} step(s)"))
         driver = None
         try:
             driver = self.new_driver(cfg)
@@ -983,6 +1510,8 @@ class App(tk.Tk):
             q.put(("log", f"   test file: {saved}{self.describe_pdf(cfg, saved)}"))
             q.put(("log", f"   opening it (saved in: {cfg['folder']})"))
             open_file(os.path.join(cfg["folder"], saved))
+        except BlockedPage as e:
+            q.put(("log", f"   blocked / error page: {e}"))
         except Exception as e:
             short = str(e).splitlines()[0] if str(e) else type(e).__name__
             q.put(("log", f"   test error: {short}"))
@@ -992,7 +1521,7 @@ class App(tk.Tk):
 
     def stop(self):
         self.stop_event.set()
-        self.msg_queue.put(("log", "Stopping after the current link..."))
+        self.msg_queue.put(("log", "Stopping after the current link(s)..."))
 
     # ---------------- worker ----------------
     def make_options(self, cfg):
@@ -1027,11 +1556,11 @@ class App(tk.Tk):
             apply_stealth_options(options)
         return options
 
-    def run_steps(self, driver, cfg):
+    def run_steps(self, driver, steps, cfg, tag=""):
         q = self.msg_queue
-        for n, st in enumerate(cfg["steps"], 1):
+        for n, st in enumerate(steps, 1):
             if st["type"] == "wait":
-                q.put(("log", f"   step {n}: waiting {st['seconds']:g} s"))
+                q.put(("log", f"   {tag}step {n}: waiting {st['seconds']:g} s"))
                 time.sleep(st["seconds"])
                 continue
 
@@ -1046,7 +1575,7 @@ class App(tk.Tk):
             if not els:
                 msg = f"step {n}: element not found ({st['selector']})"
                 if cfg["continue_missing"]:
-                    q.put(("log", f"   warning: {msg}"))
+                    q.put(("log", f"   {tag}warning: {msg}"))
                     continue
                 raise RuntimeError(msg)
 
@@ -1059,7 +1588,7 @@ class App(tk.Tk):
                     clicked += 1
                 except Exception:
                     pass
-            q.put(("log", f"   step {n}: clicked {clicked} element(s)"))
+            q.put(("log", f"   {tag}step {n}: clicked {clicked} element(s)"))
             time.sleep(cfg["step_delay"])
 
     @staticmethod
@@ -1070,9 +1599,9 @@ class App(tk.Tk):
         except Exception:
             return False
 
-    @staticmethod
-    def close_driver(driver):
+    def close_driver(self, driver):
         if driver is not None:
+            self.live_drivers.discard(driver)
             try:
                 driver.quit()
             except Exception:
@@ -1109,6 +1638,7 @@ class App(tk.Tk):
             driver = webdriver.Chrome(service=make_service(cfg["driver"]), options=self.make_options(cfg))
         if cfg.get("stealth"):
             apply_stealth_driver(driver)
+        self.live_drivers.add(driver)
         return driver
 
     def print_direct(self, driver, cfg, filename):
@@ -1164,15 +1694,32 @@ class App(tk.Tk):
             time.sleep(0.4)
         return None
 
-    def process_url(self, driver, i, link, cfg):
+    def sleep_interruptible(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end and not self.stop_event.is_set():
+            time.sleep(0.2)
+
+    def process_url(self, driver, i, link, cfg, tag=""):
         driver.get(link)
         time.sleep(cfg["load_wait"])
         if cfg["stop_loading"]:
             driver.execute_script("window.stop();")
 
-        if cfg["steps"]:
-            self.run_steps(driver, cfg)
+        if cfg["detect"]:
+            reason = detect_blocked(driver)
+            if reason:
+                raise BlockedPage(reason)
+
+        steps = steps_for_url(cfg["step_sets"], link)
+        if steps:
+            self.run_steps(driver, steps, cfg, tag)
             time.sleep(cfg["after_steps"])
+
+        if cfg["hide"] or cfg["unstick"]:
+            try:
+                driver.execute_script(HIDE_JS, cfg["hide"], cfg["unstick"])
+            except Exception:
+                pass
 
         stamp = time.strftime("%H-%M-%S")
         is_test = cfg.get("test", False)
@@ -1196,58 +1743,133 @@ class App(tk.Tk):
             raise RuntimeError(f"PDF file did not appear within {cfg['wait']} s")
         return saved, driver.current_url
 
+    def process_with_retries(self, i, link, cfg, holder, tag):
+        """Returns (status, filename, page_url, note). Retries failed links."""
+        q = self.msg_queue
+        attempts = cfg["retries"] + 1
+        status, note = "Error", ""
+        for attempt in range(1, attempts + 1):
+            if self.stop_event.is_set():
+                break
+            try:
+                if holder["d"] is None:
+                    holder["d"] = self.new_driver(cfg)
+                saved, current_url = self.process_url(holder["d"], i, link, cfg, tag)
+                q.put(("log", f"   {tag}saved: {saved}{self.describe_pdf(cfg, saved)}"))
+                return "OK", saved, current_url, ""
+            except BlockedPage as e:
+                status, note = "Blocked", str(e)
+            except Exception as e:
+                status = "Error"
+                note = str(e).splitlines()[0] if str(e) else type(e).__name__
+            finally:
+                d = holder["d"]
+                if d is not None and (cfg["new_browser"] or not self.driver_alive(d)):
+                    self.close_driver(d)
+                    holder["d"] = None
+            q.put(("log", f"   {tag}{'blocked' if status == 'Blocked' else 'error'}: {note}"))
+            if attempt < attempts and not self.stop_event.is_set():
+                q.put(("log", f"   {tag}retrying ({attempt}/{attempts - 1})..."))
+                self.sleep_interruptible(cfg["retry_delay"])
+        return status, "Error", "", note
+
+    def worker_loop(self, wid, n_workers, task_q, cfg, ctx):
+        q = self.msg_queue
+        tag = f"[W{wid}] " if n_workers > 1 else ""
+        holder = {"d": None}
+        first = True
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    i, link = task_q.get_nowait()
+                except queue.Empty:
+                    break
+                if not first and cfg["url_delay"] > 0:
+                    jitter = random.uniform(0.7, 1.5) if cfg["stealth"] else 1
+                    self.sleep_interruptible(cfg["url_delay"] * jitter)
+                    if self.stop_event.is_set():
+                        break
+                first = False
+
+                q.put(("log", f"{tag}[{i + 1}/{ctx['total']}] {link}"))
+                status, saved, current_url, note = self.process_with_retries(i, link, cfg, holder, tag)
+                row = [link, current_url, saved, datetime.datetime.now(), status, note]
+                with ctx["lock"]:
+                    ctx["out"].write(tsv(row))
+                    ctx["out"].flush()
+                    ctx["done"] += 1
+                    key = {"OK": "ok", "Blocked": "blocked"}.get(status, "error")
+                    ctx[key] += 1
+                    q.put(("progress", (ctx["done"], ctx["total"])))
+        finally:
+            self.close_driver(holder["d"])
+
     def run_job(self, links, cfg):
         q = self.msg_queue
         total = len(links)
         status_path = os.path.join(cfg["folder"], "Output Status.txt")
-        new_file = not os.path.exists(status_path)
-        driver = None
+
+        rows = load_status(status_path)
+
+        done_links = set()
+        if cfg["resume"]:
+            for r in rows:
+                if r[4] == "OK" and r[2] and os.path.exists(os.path.join(cfg["folder"], r[2])):
+                    done_links.add(r[0])
+        todo = [(i, l) for i, l in enumerate(links) if l not in done_links]
+        skipped = total - len(todo)
+
+        # Rewrite the report in the current format, dropping the old rows of links that
+        # are processed again now, so each link keeps exactly one (the latest) row.
+        todo_links = {l for _, l in todo}
+        try:
+            write_status(status_path, [r for r in rows if r[0] not in todo_links])
+        except OSError as e:
+            q.put(("log", f"Cannot write the report file: {e}"))
+            q.put(("done", None))
+            return
+        if skipped:
+            q.put(("log", f"Resume: skipping {skipped} link(s) already saved. "
+                          "Failed links from the last run will be tried again."))
+
+        ctx = {"lock": threading.Lock(), "done": skipped, "total": total,
+               "ok": 0, "blocked": 0, "error": 0}
+        q.put(("progress", (skipped, total)))
+
+        wanted = cfg["workers"]
+        if wanted > 1 and cfg["engine"] != "direct":
+            q.put(("log", "Parallel browsers need the Direct PDF method; using 1 browser."))
+            wanted = 1
+        n_workers = max(1, min(wanted, len(todo))) if todo else 0
+        if n_workers > 1:
+            q.put(("log", f"Using {n_workers} parallel browsers."))
+
+        task_q = queue.Queue()
+        for t in todo:
+            task_q.put(t)
 
         try:
             with open(status_path, "a", encoding="utf-8") as out:
-                if new_file:
-                    out.write("Link\tPage Link\tFilename\tDate&Time\n")
-
-                for i, link in enumerate(links):
-                    if self.stop_event.is_set():
-                        q.put(("log", "Stopped."))
-                        break
-
-                    if i > 0 and cfg["url_delay"] > 0:
-                        delay = cfg["url_delay"] * (random.uniform(0.7, 1.5) if cfg["stealth"] else 1)
-                        end = time.time() + delay
-                        while time.time() < end and not self.stop_event.is_set():
-                            time.sleep(0.2)
-                        if self.stop_event.is_set():
-                            q.put(("log", "Stopped."))
-                            break
-
-                    q.put(("log", f"[{i + 1}/{total}] {link}"))
-                    try:
-                        if driver is None:
-                            driver = self.new_driver(cfg)
-                        saved, current_url = self.process_url(driver, i, link, cfg)
-                        row = f"{link}\t{current_url}\t{saved}\t{datetime.datetime.now()}\n"
-                        q.put(("log", f"   saved: {saved}{self.describe_pdf(cfg, saved)}"))
-                    except Exception as e:
-                        short = str(e).splitlines()[0] if str(e) else type(e).__name__
-                        row = f"{link}\tError: {short}\tError\t{datetime.datetime.now()}\n"
-                        q.put(("log", f"   error: {short}"))
-                    finally:
-                        # Close after every URL, or when the shared browser died / was closed
-                        if driver is not None and (cfg["new_browser"] or not self.driver_alive(driver)):
-                            self.close_driver(driver)
-                            driver = None
-
-                    out.write(row)
-                    out.flush()
-                    q.put(("progress", (i + 1, total)))
+                ctx["out"] = out
+                threads = [
+                    threading.Thread(
+                        target=self.worker_loop,
+                        args=(w + 1, n_workers, task_q, cfg, ctx),
+                        daemon=True,
+                    )
+                    for w in range(n_workers)
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
         except Exception as e:
             q.put(("log", f"General error: {e}"))
-        finally:
-            self.close_driver(driver)
 
-        q.put(("log", f"Finished. Results log: {status_path}"))
+        if self.stop_event.is_set():
+            q.put(("log", "Stopped."))
+        q.put(("log", f"Finished: {ctx['ok']} saved, {ctx['blocked']} blocked, "
+                      f"{ctx['error']} failed, {skipped} skipped. Report: {status_path}"))
         q.put(("done", None))
 
 
