@@ -5,6 +5,7 @@ import base64
 import sys
 import subprocess
 import time
+import random
 import queue
 import datetime
 import threading
@@ -187,6 +188,35 @@ def parse_selector(sel):
     return By.CSS_SELECTOR, sel
 
 
+STEALTH_JS = r"""
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = window.chrome || { runtime: {} };
+"""
+
+
+def apply_stealth_options(options):
+    """Remove the most obvious automation signals (basic, not a guarantee)."""
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--lang=en-US")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+
+def apply_stealth_driver(driver):
+    """Hide navigator.webdriver, the 'HeadlessChrome' marker and set a normal Accept-Language."""
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
+    except Exception:
+        pass
+    try:
+        ua = driver.execute_script("return navigator.userAgent")
+        driver.execute_cdp_cmd(
+            "Network.setUserAgentOverride",
+            {"userAgent": ua.replace("HeadlessChrome", "Chrome"), "acceptLanguage": "en-US,en;q=0.9"},
+        )
+    except Exception:
+        pass
+
+
 def open_file(path):
     """Open a file with the default viewer (used to show the test PDF)."""
     try:
@@ -258,6 +288,8 @@ class App(tk.Tk):
         self.var_engine = tk.StringVar(value="direct")
         self.var_custom_w = tk.DoubleVar(value=210)
         self.var_custom_h = tk.DoubleVar(value=297)
+        self.var_stealth = tk.BooleanVar(value=False)
+        self.var_url_delay = tk.DoubleVar(value=0)
         self.var_step_timeout = tk.DoubleVar(value=10)
         self.var_step_delay = tk.DoubleVar(value=1)
         self.var_after_steps = tk.DoubleVar(value=2)
@@ -319,6 +351,8 @@ class App(tk.Tk):
         ttk.Spinbox(opts, from_=1, to=120, width=6, textvariable=self.var_load_wait).pack(side="left", padx=(4, 16))
         ttk.Label(opts, text="PDF save timeout (s):").pack(side="left")
         ttk.Spinbox(opts, from_=1, to=300, width=6, textvariable=self.var_wait).pack(side="left", padx=(4, 16))
+        ttk.Label(opts, text="Delay between URLs (s):").pack(side="left")
+        ttk.Spinbox(opts, from_=0, to=300, increment=0.5, width=6, textvariable=self.var_url_delay).pack(side="left", padx=(4, 16))
 
         pg = ttk.Frame(box)
         pg.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
@@ -364,17 +398,20 @@ class App(tk.Tk):
         ttk.Checkbutton(
             checks, text="Remove duplicate links automatically",
             variable=self.var_dedupe, command=self.update_link_count,
+        ).pack(side="left", padx=(0, 20))
+        ttk.Checkbutton(
+            checks, text="Stealth mode (reduce automation signals)", variable=self.var_stealth,
         ).pack(side="left")
 
-        # ----- Links + Steps -----
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, padx=10, pady=4)
-        mid.columnconfigure(0, weight=1)
-        mid.columnconfigure(1, weight=1)
-        mid.rowconfigure(0, weight=1)
+        # ----- Links | Steps | Log  (drag the dividers to resize) -----
+        pane_opts = dict(sashwidth=8, sashrelief="flat", bg="#E9ECF1", bd=0, opaqueresize=True)
+        main_pane = tk.PanedWindow(self, orient="vertical", **pane_opts)
+        main_pane.pack(fill="both", expand=True, padx=10, pady=4)
+        mid = tk.PanedWindow(main_pane, orient="horizontal", **pane_opts)
+        main_pane.add(mid, stretch="always", minsize=200)
 
         links = ttk.LabelFrame(mid, text="Links (one per line)")
-        links.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        mid.add(links, stretch="always", minsize=260)
         self.txt_links = scrolledtext.ScrolledText(links, height=10, width=40, wrap="none", **TEXT_OPTS)
         self.txt_links.pack(fill="both", expand=True, padx=6, pady=6)
         bar = ttk.Frame(links)
@@ -386,7 +423,7 @@ class App(tk.Tk):
         self.txt_links.bind("<<Modified>>", self.on_links_modified)
 
         steps = ttk.LabelFrame(mid, text="Steps run on every link before saving")
-        steps.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        mid.add(steps, stretch="always", minsize=410)
 
         lf = ttk.Frame(steps)
         lf.pack(fill="both", expand=True, padx=6, pady=(6, 2))
@@ -427,13 +464,13 @@ class App(tk.Tk):
         ttk.Checkbutton(sg, text="Continue if an element is not found", variable=self.var_continue).grid(row=1, column=2, columnspan=2, sticky="w", pady=(4, 0))
 
         # ----- Log -----
-        logf = ttk.LabelFrame(self, text="Log")
-        logf.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        logf = ttk.LabelFrame(main_pane, text="Log")
+        main_pane.add(logf, stretch="always", minsize=90)
         self.txt_log = scrolledtext.ScrolledText(logf, height=7, state="disabled", **TEXT_OPTS)
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
 
         for v in (self.var_page_size, self.var_landscape, self.var_scale, self.var_engine,
-                  self.var_browser_mode, self.var_custom_w, self.var_custom_h):
+                  self.var_browser_mode, self.var_custom_w, self.var_custom_h, self.var_stealth):
             v.trace_add("write", self.update_summary)
         self.update_summary()
         self.set_options(False)
@@ -535,6 +572,8 @@ class App(tk.Tk):
             "Direct PDF" if direct else "Print dialog",
             "one browser" if self.var_browser_mode.get() == "single" else "browser per URL",
         ]
+        if self.var_stealth.get():
+            parts.append("stealth")
         self.lbl_summary.config(text="   \u00B7   ".join(parts))
 
     # ---------------- helpers ----------------
@@ -773,7 +812,9 @@ class App(tk.Tk):
         self.log("Recording started. Click the elements you want in the browser window, "
                  "in order, then press 'Stop recording' here.")
         threading.Thread(
-            target=self.record_worker, args=(url, self.var_driver.get().strip()), daemon=True
+            target=self.record_worker,
+            args=(url, self.var_driver.get().strip(), self.var_stealth.get()),
+            daemon=True,
         ).start()
 
     def drain_logs(self, driver):
@@ -792,15 +833,19 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    def record_worker(self, url, driver_path):
+    def record_worker(self, url, driver_path, stealth=False):
         q = self.msg_queue
         driver = None
         try:
             options = webdriver.ChromeOptions()
             options.add_argument("--start-maximized")
             options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
+            if stealth:
+                apply_stealth_options(options)
             driver = webdriver.Chrome(service=make_service(driver_path), options=options)
             self.rec_driver = driver
+            if stealth:
+                apply_stealth_driver(driver)
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": REC_JS})
             driver.get(url)
 
@@ -865,6 +910,8 @@ class App(tk.Tk):
             "engine": self.var_engine.get(),
             "custom_w": num(self.var_custom_w, 210),
             "custom_h": num(self.var_custom_h, 297),
+            "stealth": self.var_stealth.get(),
+            "url_delay": num(self.var_url_delay, 0),
         }
         return links, cfg
 
@@ -976,6 +1023,8 @@ class App(tk.Tk):
         options.add_argument("--start-maximized")
         options.add_argument("--kiosk-printing")
         options.add_experimental_option("prefs", prefs)
+        if cfg.get("stealth"):
+            apply_stealth_options(options)
         return options
 
     def run_steps(self, driver, cfg):
@@ -1036,16 +1085,18 @@ class App(tk.Tk):
         except OSError:
             return set()
 
-    def make_direct_options(self):
+    def make_direct_options(self, cfg):
         options = webdriver.ChromeOptions()
         options.page_load_strategy = "none"
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
+        if cfg.get("stealth"):
+            apply_stealth_options(options)
         return options
 
     def new_driver(self, cfg):
         if cfg["engine"] == "direct":
-            driver = webdriver.Chrome(service=make_service(cfg["driver"]), options=self.make_direct_options())
+            driver = webdriver.Chrome(service=make_service(cfg["driver"]), options=self.make_direct_options(cfg))
             try:  # remove the "HeadlessChrome" marker that some sites block
                 ua = driver.execute_script("return navigator.userAgent")
                 driver.execute_cdp_cmd(
@@ -1054,8 +1105,11 @@ class App(tk.Tk):
                 )
             except Exception:
                 pass
-            return driver
-        return webdriver.Chrome(service=make_service(cfg["driver"]), options=self.make_options(cfg))
+        else:
+            driver = webdriver.Chrome(service=make_service(cfg["driver"]), options=self.make_options(cfg))
+        if cfg.get("stealth"):
+            apply_stealth_driver(driver)
+        return driver
 
     def print_direct(self, driver, cfg, filename):
         """Save the page with Chrome's PDF engine: exact paper size and scale, no dialog."""
@@ -1158,6 +1212,15 @@ class App(tk.Tk):
                     if self.stop_event.is_set():
                         q.put(("log", "Stopped."))
                         break
+
+                    if i > 0 and cfg["url_delay"] > 0:
+                        delay = cfg["url_delay"] * (random.uniform(0.7, 1.5) if cfg["stealth"] else 1)
+                        end = time.time() + delay
+                        while time.time() < end and not self.stop_event.is_set():
+                            time.sleep(0.2)
+                        if self.stop_event.is_set():
+                            q.put(("log", "Stopped."))
+                            break
 
                     q.put(("log", f"[{i + 1}/{total}] {link}"))
                     try:
