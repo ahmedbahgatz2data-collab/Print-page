@@ -10,6 +10,10 @@ import queue
 import datetime
 import threading
 import zipfile
+import hashlib
+import shutil
+import tempfile
+import urllib.request
 import urllib.parse
 import tkinter as tk
 import tkinter.font as tkfont
@@ -264,6 +268,22 @@ def num(var, default):
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
 STATUS_HEADER = ["Link", "Page Link", "Filename", "Date&Time", "Status", "Notes"]
+APP_VERSION = "1.0.0"
+# Where the program looks for new versions. Set it before you build the exe
+# (users can also type it in the Options panel). It can be:
+#   GitHub releases:  https://api.github.com/repos/OWNER/REPO/releases/latest
+#   a manifest file:  https://example.com/webtopdf/version.json
+#   a shared folder:  \\server\share\WebToPDF   (contains version.json and the exe)
+DEFAULT_UPDATE_SOURCE = ""
+
+LAYOUT_PAGED = "Normal pages"
+LAYOUT_LONG = "Single long page"
+LAYOUT_FIT = "Fit on one page"
+LAYOUTS = (LAYOUT_PAGED, LAYOUT_LONG, LAYOUT_FIT)
+MARGIN_IN = 0.4        # margins used by the single-page layouts (inches)
+MAX_PAGE_IN = 200.0    # largest page height Chrome can write (inches)
+SITE_KEYS = ("page_size", "custom_w", "custom_h", "landscape", "scale", "layout",
+             "load_wait", "after_steps", "step_delay", "step_timeout", "wait")
 
 
 class BlockedPage(Exception):
@@ -526,13 +546,187 @@ def write_xlsx(path, rows, widths=(60, 60, 45, 22, 10, 50)):
             z.writestr(name, content)
 
 
+def pdf_page_count(data):
+    """Number of pages in PDF bytes, or None if it can't be read."""
+    n = len(re.findall(rb"/Type\s*/Page(?![A-Za-z])", data))
+    return n or None
+
+
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def clean_site_settings(data):
+    """Keep only valid per-site overrides (used when loading saved settings)."""
+    out = {}
+    if not isinstance(data, dict):
+        return out
+    for host, ov in data.items():
+        if not isinstance(host, str) or not isinstance(ov, dict):
+            continue
+        c = {}
+        for k, v in ov.items():
+            if k == "page_size" and isinstance(v, str):
+                c[k] = v
+            elif k == "layout" and v in LAYOUTS:
+                c[k] = v
+            elif k == "landscape" and isinstance(v, bool):
+                c[k] = v
+            elif k == "scale" and _is_number(v) and 10 <= v <= 200:
+                c[k] = int(v)
+            elif k in ("custom_w", "custom_h") and _is_number(v) and 20 <= v <= 5000:
+                c[k] = float(v)
+            elif k in ("load_wait", "after_steps", "step_delay", "step_timeout", "wait") \
+                    and _is_number(v) and 0 <= v <= 600:
+                c[k] = v
+        if c:
+            out[host] = c
+    return out
+
+
+def site_overrides(site_settings, url):
+    host = host_of(url)
+    best = None
+    for key in site_settings:
+        if host_matches(host, key) and (best is None or len(key) > len(best)):
+            best = key
+    return site_settings[best] if best is not None else {}
+
+
+def apply_site(cfg, url):
+    """The settings to use for this link: global options plus the site's own overrides."""
+    ov = site_overrides(cfg.get("site_settings") or {}, url)
+    if not ov:
+        return cfg
+    new = dict(cfg)
+    new.update({k: v for k, v in ov.items() if k in SITE_KEYS})
+    return new
+
+
+# ----- updates -----
+def parse_version(text):
+    return tuple(int(x) for x in re.findall(r"\d+", str(text))[:4])
+
+
+def is_newer(candidate, current):
+    return parse_version(candidate) > parse_version(current)
+
+
+def parse_update_info(data, base):
+    """Understands a GitHub 'latest release' answer or a simple version.json manifest."""
+    if not isinstance(data, dict):
+        raise ValueError("Unrecognized update information.")
+    if "tag_name" in data:
+        asset = next((a for a in data.get("assets", [])
+                      if str(a.get("name", "")).lower().endswith(".exe")), None)
+        if not asset:
+            raise ValueError("The latest release has no .exe file.")
+        digest = str(asset.get("digest") or "")
+        sha = digest.split(":", 1)[1] if digest.lower().startswith("sha256:") else ""
+        return {"version": str(data["tag_name"]).lstrip("vV"), "url": asset["browser_download_url"],
+                "sha256": sha, "notes": str(data.get("body") or "")[:600]}
+    if "version" in data and "url" in data:
+        url = str(data["url"])
+        if not re.match(r"^https?://", url, re.I) and not os.path.isabs(url):
+            if re.match(r"^https?://", base, re.I):
+                url = urllib.parse.urljoin(base, url)
+            else:
+                url = os.path.join(os.path.dirname(base), url)
+        return {"version": str(data["version"]).lstrip("vV"), "url": url,
+                "sha256": str(data.get("sha256") or ""), "notes": str(data.get("notes") or "")[:600]}
+    raise ValueError("Unrecognized update manifest.")
+
+
+def fetch_update_info(source):
+    source = (source or "").strip()
+    if not source:
+        raise ValueError("No update source is set.")
+    if re.match(r"^https?://", source, re.I):
+        if not source.lower().startswith("https://"):
+            raise ValueError("The update source must use https://")
+        req = urllib.request.Request(
+            source, headers={"User-Agent": f"WebToPDF/{APP_VERSION}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read()
+    else:
+        source = os.path.join(source, "version.json") if os.path.isdir(source) else source
+        with open(source, "rb") as f:
+            raw = f.read()
+    return parse_update_info(json.loads(raw.decode("utf-8-sig")), source)
+
+
+def download_update(url, dest, expected_sha="", progress=None, min_size=1_000_000):
+    """Download (https or shared folder), check it is a program and verify the checksum."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    h = hashlib.sha256()
+    done = 0
+    if re.match(r"^https?://", url, re.I):
+        if not url.lower().startswith("https://"):
+            raise ValueError("Downloads must use https://")
+        req = urllib.request.Request(url, headers={"User-Agent": f"WebToPDF/{APP_VERSION}"})
+        src = urllib.request.urlopen(req, timeout=30)
+        total = int(src.headers.get("Content-Length") or 0)
+    else:
+        src = open(url, "rb")
+        total = os.path.getsize(url)
+    try:
+        with src, open(dest, "wb") as out:
+            while True:
+                chunk = src.read(256 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+    except Exception:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise
+    with open(dest, "rb") as f:
+        head = f.read(2)
+    if head != b"MZ" or done < min_size:
+        os.remove(dest)
+        raise ValueError("The downloaded file is not a valid program.")
+    if expected_sha and h.hexdigest().lower() != expected_sha.lower():
+        os.remove(dest)
+        raise ValueError("Checksum mismatch: the download is damaged or was changed.")
+    return h.hexdigest()
+
+
+def build_update_script(new_path, old_path):
+    """Windows batch file: waits for the program to exit, swaps the exe, starts it again."""
+    esc = lambda p: p.replace("%", "%%")
+    return "\r\n".join([
+        "@echo off",
+        f'set "NEW={esc(new_path)}"',
+        f'set "OLD={esc(old_path)}"',
+        "set /a tries=0",
+        ":wait",
+        "ping 127.0.0.1 -n 2 >nul",
+        'move /y "%NEW%" "%OLD%" >nul 2>&1',
+        "if not errorlevel 1 goto done",
+        "set /a tries+=1",
+        "if %tries% lss 30 goto wait",
+        "goto end",
+        ":done",
+        'start "" "%OLD%"',
+        ":end",
+        '(goto) 2>nul & del "%~f0"',
+        "",
+    ])
+
+
 # ===== end of pure-logic helpers =====
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Web Pages to PDF")
+        self.title(f"Web Pages to PDF  v{APP_VERSION}")
         self.geometry("1020x780")
         self.minsize(900, 640)
 
@@ -548,6 +742,7 @@ class App(tk.Tk):
         self.current_set = ALL_SITES
         self.hide_text = ""
         self.saved_links = ""
+        self.site_settings = {}
         self._drag_idx = None
 
         self.var_folder = tk.StringVar()
@@ -575,6 +770,9 @@ class App(tk.Tk):
         self.var_resume = tk.BooleanVar(value=True)
         self.var_detect = tk.BooleanVar(value=True)
         self.var_unstick = tk.BooleanVar(value=False)
+        self.var_layout = tk.StringVar(value=LAYOUT_PAGED)
+        self.var_update_source = tk.StringVar(value=DEFAULT_UPDATE_SOURCE)
+        self.var_auto_update = tk.BooleanVar(value=True)
 
         # Everything here is remembered between runs
         self.persist = {
@@ -589,6 +787,8 @@ class App(tk.Tk):
             "after_steps": self.var_after_steps, "continue": self.var_continue,
             "retries": self.var_retries, "workers": self.var_workers,
             "resume": self.var_resume, "detect": self.var_detect, "unstick": self.var_unstick,
+            "layout": self.var_layout, "update_source": self.var_update_source,
+            "auto_update": self.var_auto_update,
         }
         self.load_settings()
 
@@ -598,6 +798,7 @@ class App(tk.Tk):
             self.update_link_count()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self.poll_queue)
+        self.after(1500, self.auto_check_updates)
 
     # The steps list shown in the UI is the one of the selected site
     @property
@@ -632,6 +833,7 @@ class App(tk.Tk):
                 self.current_set = data["current_set"]
         if isinstance(data.get("hide_text"), str):
             self.hide_text = data["hide_text"]
+        self.site_settings = clean_site_settings(data.get("site_settings"))
         if isinstance(data.get("links"), str):
             self.saved_links = data["links"]
         size = data.get("size")
@@ -648,6 +850,7 @@ class App(tk.Tk):
         data["step_sets"] = self.step_sets
         data["current_set"] = self.current_set
         data["hide_text"] = self.hide_text
+        data["site_settings"] = self.site_settings
         data["links"] = self.txt_links.get("1.0", "end").strip()
         if self.winfo_width() > 600 and self.winfo_height() > 400:
             data["size"] = f"{self.winfo_width()}x{self.winfo_height()}"
@@ -753,7 +956,11 @@ class App(tk.Tk):
         ttk.Radiobutton(
             eng, text="Chrome print dialog (fallback)",
             variable=self.var_engine, value="kiosk",
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, 20))
+        ttk.Label(eng, text="Layout:").pack(side="left")
+        ttk.Combobox(
+            eng, textvariable=self.var_layout, state="readonly", width=17, values=list(LAYOUTS),
+        ).pack(side="left", padx=(4, 0))
 
         rel = ttk.Frame(box)
         rel.grid(row=6, column=0, columnspan=3, sticky="w", **pad)
@@ -779,6 +986,13 @@ class App(tk.Tk):
         ttk.Checkbutton(ex, text="Skip links already saved (resume)", variable=self.var_resume).pack(side="left", padx=(0, 20))
         ttk.Checkbutton(ex, text="Detect blocked / error pages", variable=self.var_detect).pack(side="left", padx=(0, 20))
         ttk.Button(ex, text="Hide elements...", command=self.edit_hide).pack(side="left")
+
+        up = ttk.Frame(box)
+        up.grid(row=9, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(up, text="Update source (web address or shared folder):").pack(side="left")
+        ttk.Entry(up, textvariable=self.var_update_source, width=44).pack(side="left", padx=(4, 8))
+        ttk.Checkbutton(up, text="Check on start", variable=self.var_auto_update).pack(side="left", padx=(0, 8))
+        ttk.Button(up, text="Check for updates", command=lambda: self.check_updates(silent=False)).pack(side="left")
 
         # ----- Links | Steps | Log  (drag the dividers to resize) -----
         pane_opts = dict(sashwidth=8, sashrelief="flat", bg="#E9ECF1", bd=0, opaqueresize=True)
@@ -814,6 +1028,11 @@ class App(tk.Tk):
             steps, text="A site's own steps replace the 'All sites' steps for that site.",
             foreground="#8A94A6",
         ).pack(anchor="w", padx=8, pady=(2, 0))
+        ss = ttk.Frame(steps)
+        ss.pack(fill="x", padx=6, pady=(4, 0))
+        ttk.Button(ss, text="Site settings...", command=self.edit_site_settings).pack(side="left")
+        self.lbl_site = ttk.Label(ss, text="", foreground="#8A94A6")
+        self.lbl_site.pack(side="left", padx=8)
 
         lf = ttk.Frame(steps)
         lf.pack(fill="both", expand=True, padx=6, pady=(6, 2))
@@ -865,7 +1084,7 @@ class App(tk.Tk):
 
         for v in (self.var_page_size, self.var_landscape, self.var_scale, self.var_engine,
                   self.var_browser_mode, self.var_custom_w, self.var_custom_h, self.var_stealth,
-                  self.var_workers):
+                  self.var_workers, self.var_layout):
             v.trace_add("write", self.update_summary)
         self.update_summary()
         self.refresh_sets()
@@ -972,6 +1191,8 @@ class App(tk.Tk):
         workers = num(self.var_workers, 1)
         if direct and workers > 1:
             parts.append(f"{workers} parallel")
+        if direct and self.var_layout.get() != LAYOUT_PAGED:
+            parts.append(self.var_layout.get().lower())
         if self.var_stealth.get():
             parts.append("stealth")
         self.lbl_summary.config(text="   \u00B7   ".join(parts))
@@ -1083,6 +1304,185 @@ class App(tk.Tk):
         ttk.Button(btns, text="OK", command=ok).pack(side="right", padx=6)
         dlg.grab_set()
 
+    # ---------------- site settings (time and page size per domain) ----------------
+    def update_site_label(self):
+        if self.current_set == ALL_SITES:
+            text = "The Options panel applies to all sites."
+        elif self.current_set in self.site_settings:
+            text = "This site uses its own settings."
+        else:
+            text = "This site uses the Options panel settings."
+        self.lbl_site.config(text=text)
+
+    def edit_site_settings(self):
+        if self.current_set == ALL_SITES:
+            messagebox.showinfo(
+                "Site settings",
+                "Pick a site first (New site...). 'All sites' uses the Options panel.",
+            )
+            return
+        host = self.current_set
+        cur = self.site_settings.get(host, {})
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Settings for {host}")
+        dlg.transient(self)
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+
+        use = tk.BooleanVar(value=host in self.site_settings)
+        size = tk.StringVar(value=cur.get("page_size", self.var_page_size.get()))
+        cw = tk.DoubleVar(value=cur.get("custom_w", num(self.var_custom_w, 210)))
+        ch = tk.DoubleVar(value=cur.get("custom_h", num(self.var_custom_h, 297)))
+        land = tk.BooleanVar(value=cur.get("landscape", self.var_landscape.get()))
+        layout = tk.StringVar(value=cur.get("layout", self.var_layout.get()))
+        numbers = [
+            ("Scale %:", tk.IntVar(value=cur.get("scale", num(self.var_scale, 100))), 10, 200, 1, "scale"),
+            ("Page load wait (s):", tk.DoubleVar(value=cur.get("load_wait", num(self.var_load_wait, 5))), 0, 120, 1, "load_wait"),
+            ("Wait after steps (s):", tk.DoubleVar(value=cur.get("after_steps", num(self.var_after_steps, 2))), 0, 120, 0.5, "after_steps"),
+            ("Delay between steps (s):", tk.DoubleVar(value=cur.get("step_delay", num(self.var_step_delay, 1))), 0, 60, 0.5, "step_delay"),
+            ("Element timeout (s):", tk.DoubleVar(value=cur.get("step_timeout", num(self.var_step_timeout, 10))), 1, 120, 1, "step_timeout"),
+            ("PDF save timeout (s, print dialog only):", tk.DoubleVar(value=cur.get("wait", num(self.var_wait, 5))), 1, 300, 1, "wait"),
+        ]
+
+        pad = {"padx": 10, "pady": 3}
+        ttk.Checkbutton(dlg, text="Use custom settings for this site", variable=use).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 4))
+        ttk.Label(dlg, text="Page size:").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Combobox(
+            dlg, textvariable=size, state="readonly", width=18,
+            values=["Browser default"] + list(PAGE_SIZES) + [CUSTOM_SIZE],
+        ).grid(row=1, column=1, sticky="w", **pad)
+        ttk.Checkbutton(dlg, text="Landscape", variable=land).grid(row=1, column=2, sticky="w", **pad)
+        ttk.Label(dlg, text="Custom size (mm):").grid(row=2, column=0, sticky="w", **pad)
+        cs = ttk.Frame(dlg)
+        cs.grid(row=2, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Spinbox(cs, from_=20, to=2000, width=7, textvariable=cw).pack(side="left")
+        ttk.Label(cs, text="  x  ").pack(side="left")
+        ttk.Spinbox(cs, from_=20, to=2000, width=7, textvariable=ch).pack(side="left")
+        ttk.Label(dlg, text="Layout (Direct PDF):").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Combobox(
+            dlg, textvariable=layout, state="readonly", width=18, values=list(LAYOUTS),
+        ).grid(row=3, column=1, sticky="w", **pad)
+        for n, (label, var, lo, hi, inc, _key) in enumerate(numbers, start=4):
+            ttk.Label(dlg, text=label).grid(row=n, column=0, sticky="w", **pad)
+            ttk.Spinbox(dlg, from_=lo, to=hi, increment=inc, width=8, textvariable=var).grid(
+                row=n, column=1, sticky="w", **pad)
+
+        def ok():
+            if not use.get():
+                self.site_settings.pop(host, None)
+            else:
+                try:
+                    new = {"page_size": size.get(), "layout": layout.get(),
+                           "landscape": land.get(), "custom_w": float(cw.get()),
+                           "custom_h": float(ch.get())}
+                    for _label, var, _lo, _hi, _inc, key in numbers:
+                        value = var.get()
+                        new[key] = int(value) if key == "scale" else float(value)
+                except (tk.TclError, ValueError):
+                    messagebox.showerror("Site settings", "Please enter valid numbers.", parent=dlg)
+                    return
+                cleaned = clean_site_settings({host: new}).get(host)
+                if cleaned:
+                    self.site_settings[host] = cleaned
+                else:
+                    self.site_settings.pop(host, None)
+            dlg.destroy()
+            self.refresh_sets()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=4 + len(numbers), column=0, columnspan=3, sticky="e", padx=10, pady=10)
+        ttk.Button(btns, text="OK", command=ok).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        dlg.grab_set()
+
+    # ---------------- updates ----------------
+    def update_source(self):
+        return self.var_update_source.get().strip() or DEFAULT_UPDATE_SOURCE
+
+    def auto_check_updates(self):
+        if self.var_auto_update.get() and self.update_source():
+            self.check_updates(silent=True)
+
+    def check_updates(self, silent=True):
+        source = self.update_source()
+        if not source:
+            if not silent:
+                self.set_options(True)
+                messagebox.showinfo(
+                    "Updates", "No update source is set. Type a web address or a shared folder "
+                               "in the Options panel (Update source).")
+            return
+        if self.worker is not None and self.worker.is_alive():
+            if not silent:
+                messagebox.showinfo("Updates", "Wait until the current job finishes.")
+            return
+        threading.Thread(target=self._check_worker, args=(source, silent), daemon=True).start()
+
+    def _check_worker(self, source, silent):
+        q = self.msg_queue
+        try:
+            info = fetch_update_info(source)
+        except Exception as e:
+            if not silent:
+                q.put(("log", f"Update check failed: {e}"))
+            return
+        if is_newer(info["version"], APP_VERSION):
+            q.put(("update_available", info))
+        elif not silent:
+            q.put(("log", f"You have the latest version ({APP_VERSION})."))
+
+    def on_update_available(self, info):
+        notes = f"\n\n{info['notes']}" if info.get("notes") else ""
+        if not messagebox.askyesno(
+            "Update available",
+            f"Version {info['version']} is available (you have {APP_VERSION}).{notes}\n\n"
+            "Download and install it now? The program will restart.",
+        ):
+            return
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Update", "Automatic install works only in the exe version.\n"
+                          f"Download the new version from:\n{info['url']}")
+            return
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showinfo("Update", "Wait until the current job finishes, then check again.")
+            return
+        self.log(f"Downloading version {info['version']}...")
+        threading.Thread(target=self._download_worker, args=(info,), daemon=True).start()
+
+    def _download_worker(self, info):
+        q = self.msg_queue
+        dest = os.path.join(tempfile.gettempdir(), "WebToPDF_update", "WebToPDF_new.exe")
+        last = {"pct": -25}
+
+        def progress(done, total):
+            if total:
+                pct = int(done * 100 / total)
+                if pct - last["pct"] >= 25:
+                    last["pct"] = pct
+                    q.put(("log", f"   downloaded {pct}%"))
+
+        try:
+            download_update(info["url"], dest, info.get("sha256", ""), progress)
+        except Exception as e:
+            q.put(("log", f"Update download failed: {e}"))
+            return
+        q.put(("update_ready", dest))
+
+    def apply_update(self, new_path):
+        old = sys.executable
+        bat = os.path.join(tempfile.gettempdir(), "WebToPDF_update", "apply_update.bat")
+        try:
+            with open(bat, "w", encoding="utf-8") as f:
+                f.write(build_update_script(new_path, old))
+            # CREATE_NO_WINDOW | DETACHED_PROCESS: keeps running after this program closes
+            subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000 | 0x00000008, close_fds=True)
+        except Exception as e:
+            self.log(f"Could not start the updater: {e}")
+            return
+        self.on_close()
+
     def log(self, text):
         self.txt_log.config(state="normal")
         self.txt_log.insert("end", text + "\n")
@@ -1109,6 +1509,11 @@ class App(tk.Tk):
                     self.steps.append(data)
                     self.refresh_steps(select=len(self.steps) - 1)
                     self.log(f"Recorded: click {data['selector']}")
+                elif kind == "update_available":
+                    self.on_update_available(data)
+                elif kind == "update_ready":
+                    self.log("Update downloaded. Restarting...")
+                    self.apply_update(data)
                 elif kind == "rec_done":
                     self.recording = False
                     self.btn_record.config(text="\u25CF Record clicks")
@@ -1133,14 +1538,16 @@ class App(tk.Tk):
 
     # ---------------- sites (steps per domain) ----------------
     def refresh_sets(self):
-        keys = [ALL_SITES] + sorted(k for k in self.step_sets if k != ALL_SITES)
+        keys = [ALL_SITES] + sorted((set(self.step_sets) | set(self.site_settings)) - {ALL_SITES})
         self.cmb_set.config(values=[ALL_SITES_LABEL if k == ALL_SITES else k for k in keys])
         self.cmb_set.set(ALL_SITES_LABEL if self.current_set == ALL_SITES else self.current_set)
+        self.update_site_label()
 
     def on_set_selected(self, _event=None):
         label = self.cmb_set.get()
         self.current_set = ALL_SITES if label == ALL_SITES_LABEL else label
         self.refresh_steps()
+        self.update_site_label()
 
     def add_site(self):
         links = self.get_links()
@@ -1163,6 +1570,7 @@ class App(tk.Tk):
             return
         if messagebox.askyesno("Delete site", f"Delete the steps of {self.current_set}?"):
             self.step_sets.pop(self.current_set, None)
+            self.site_settings.pop(self.current_set, None)
             self.current_set = ALL_SITES
             self.refresh_sets()
             self.refresh_steps()
@@ -1436,6 +1844,8 @@ class App(tk.Tk):
             "detect": self.var_detect.get(),
             "hide": parse_hide_list(self.hide_text),
             "unstick": self.var_unstick.get(),
+            "layout": self.var_layout.get(),
+            "site_settings": json.loads(json.dumps(self.site_settings)),
         }
         return links, cfg
 
@@ -1491,6 +1901,7 @@ class App(tk.Tk):
 
     def run_test(self, link, cfg):
         q = self.msg_queue
+        cfg = apply_site(cfg, link)
         direct = cfg["engine"] == "direct"
         size = cfg["page_size"]
         if size == CUSTOM_SIZE:
@@ -1641,21 +2052,95 @@ class App(tk.Tk):
         self.live_drivers.add(driver)
         return driver
 
-    def print_direct(self, driver, cfg, filename):
+    def measure_height(self, driver, layout_px):
+        """Page height (CSS px) when laid out at the given width, using the print styles."""
+        try:
+            driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
+                "width": int(layout_px), "height": 1000, "deviceScaleFactor": 1, "mobile": False})
+            driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
+            time.sleep(0.5)
+            h = driver.execute_script(
+                "return Math.max(document.documentElement.scrollHeight,"
+                " document.body ? document.body.scrollHeight : 0);")
+            return float(h)
+        except Exception:
+            return None
+        finally:
+            for cmd, args in (("Emulation.clearDeviceMetricsOverride", {}),
+                              ("Emulation.setEmulatedMedia", {"media": ""})):
+                try:
+                    driver.execute_cdp_cmd(cmd, args)
+                except Exception:
+                    pass
+
+    def print_direct(self, driver, cfg, filename, tag=""):
         """Save the page with Chrome's PDF engine: exact paper size and scale, no dialog."""
+        q = self.msg_queue
         _name, w, h = get_page_dims(cfg) or PAGE_SIZES["A4"]
-        params = {
-            "landscape": cfg["landscape"],
-            "printBackground": True,
-            "displayHeaderFooter": False,
-            "scale": min(2.0, max(0.1, cfg["scale"] / 100.0)),
-            "paperWidth": w / 25400.0,   # microns -> inches
-            "paperHeight": h / 25400.0,
-        }
-        result = driver.execute_cdp_cmd("Page.printToPDF", params)
+        w_in, h_in = w / 25400.0, h / 25400.0   # microns -> inches
+        if cfg["landscape"]:
+            w_in, h_in = h_in, w_in
+        scale = min(2.0, max(0.1, cfg["scale"] / 100.0))
+        layout = cfg.get("layout", LAYOUT_PAGED)
+
+        def render(paper_h, scale_):
+            result = driver.execute_cdp_cmd("Page.printToPDF", {
+                "printBackground": True, "displayHeaderFooter": False, "scale": scale_,
+                "paperWidth": w_in, "paperHeight": paper_h, "landscape": False,
+                "marginTop": MARGIN_IN, "marginBottom": MARGIN_IN,
+                "marginLeft": MARGIN_IN, "marginRight": MARGIN_IN,
+            })
+            return base64.b64decode(result["data"])
+
+        data = None
+        if layout == LAYOUT_LONG:
+            # One page as tall as the whole content (no page breaks)
+            reason = "could not measure the page"
+            layout_px = max(300.0, (w_in - 2 * MARGIN_IN) * 96.0 / scale)
+            content_px = self.measure_height(driver, layout_px)
+            if content_px:
+                paper_h = content_px * scale / 96.0 + 2 * MARGIN_IN + 0.2
+                for _ in range(4):
+                    if paper_h > MAX_PAGE_IN:
+                        reason = f"the page is taller than {MAX_PAGE_IN:.0f} inches"
+                        break
+                    candidate = render(paper_h, scale)
+                    if pdf_page_count(candidate) in (None, 1):
+                        data = candidate
+                        reason = None
+                        break
+                    paper_h *= 1.1  # content did not fit: try a taller page
+                else:
+                    reason = "the content did not fit one page"
+            if data is None:
+                q.put(("log", f"   {tag}single page not possible ({reason}); saving normal pages"))
+        elif layout == LAYOUT_FIT:
+            # Keep the chosen paper size and shrink the content until it fits one page
+            s = scale
+            for _ in range(8):
+                data = render(h_in, s)
+                pages = pdf_page_count(data)
+                if pages is None:
+                    q.put(("log", f"   {tag}fit to one page: page count unreadable, not verified"))
+                    break
+                if pages <= 1 or s <= 0.1:
+                    break
+                s = max(0.1, s * max(0.5, min(0.9, 0.95 / (pages ** 0.5))))
+            if abs(s - scale) > 1e-6:
+                q.put(("log", f"   {tag}fit to one page: scale reduced to {s * 100:.0f}%"))
+
+        if data is None:  # normal pages
+            pw, ph = (h_in, w_in) if cfg["landscape"] else (w_in, h_in)
+            result = driver.execute_cdp_cmd("Page.printToPDF", {
+                "landscape": cfg["landscape"], "printBackground": True,
+                "displayHeaderFooter": False, "scale": scale,
+                "paperWidth": pw, "paperHeight": ph,
+            })
+            data = base64.b64decode(result["data"])
+
         name = filename + ".pdf"
         with open(os.path.join(cfg["folder"], name), "wb") as f:
-            f.write(base64.b64decode(result["data"]))
+            f.write(data)
         return name
 
     @staticmethod
@@ -1666,6 +2151,8 @@ class App(tk.Tk):
             return ""
         w_pt, h_pt = size
         text = f"  [{w_pt / 72 * 25.4:.0f} x {h_pt / 72 * 25.4:.0f} mm]"
+        if cfg["engine"] == "direct" and cfg.get("layout", LAYOUT_PAGED) == LAYOUT_LONG:
+            return text + "  single long page"
         dims = get_page_dims(cfg)
         if dims:
             _n, w, h = dims
@@ -1732,7 +2219,7 @@ class App(tk.Tk):
             filename += f" {stamp}"  # avoid Chrome adding " (1)" to the name
 
         if cfg["engine"] == "direct":
-            saved = self.print_direct(driver, cfg, filename)
+            saved = self.print_direct(driver, cfg, filename, tag)
             return saved, driver.current_url
 
         before = self.pdf_names(cfg["folder"])
@@ -1748,14 +2235,15 @@ class App(tk.Tk):
         q = self.msg_queue
         attempts = cfg["retries"] + 1
         status, note = "Error", ""
+        ecfg = apply_site(cfg, link)  # global options + this site's own settings
         for attempt in range(1, attempts + 1):
             if self.stop_event.is_set():
                 break
             try:
                 if holder["d"] is None:
                     holder["d"] = self.new_driver(cfg)
-                saved, current_url = self.process_url(holder["d"], i, link, cfg, tag)
-                q.put(("log", f"   {tag}saved: {saved}{self.describe_pdf(cfg, saved)}"))
+                saved, current_url = self.process_url(holder["d"], i, link, ecfg, tag)
+                q.put(("log", f"   {tag}saved: {saved}{self.describe_pdf(ecfg, saved)}"))
                 return "OK", saved, current_url, ""
             except BlockedPage as e:
                 status, note = "Blocked", str(e)
@@ -1840,6 +2328,8 @@ class App(tk.Tk):
         if wanted > 1 and cfg["engine"] != "direct":
             q.put(("log", "Parallel browsers need the Direct PDF method; using 1 browser."))
             wanted = 1
+        if cfg["engine"] != "direct" and cfg.get("layout", LAYOUT_PAGED) != LAYOUT_PAGED:
+            q.put(("log", "Single-page layouts need the Direct PDF method; saving normal pages."))
         n_workers = max(1, min(wanted, len(todo))) if todo else 0
         if n_workers > 1:
             q.put(("log", f"Using {n_workers} parallel browsers."))
