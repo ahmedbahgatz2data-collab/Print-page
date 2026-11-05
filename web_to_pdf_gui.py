@@ -738,6 +738,7 @@ class App(tk.Tk):
         self.rec_driver = None
         self.live_drivers = set()
         self.opt_visible = False
+        self.pending_update = None
         self.step_sets = {ALL_SITES: []}
         self.current_set = ALL_SITES
         self.hide_text = ""
@@ -771,8 +772,6 @@ class App(tk.Tk):
         self.var_detect = tk.BooleanVar(value=True)
         self.var_unstick = tk.BooleanVar(value=False)
         self.var_layout = tk.StringVar(value=LAYOUT_PAGED)
-        self.var_update_source = tk.StringVar(value=DEFAULT_UPDATE_SOURCE)
-        self.var_auto_update = tk.BooleanVar(value=True)
 
         # Everything here is remembered between runs
         self.persist = {
@@ -787,8 +786,7 @@ class App(tk.Tk):
             "after_steps": self.var_after_steps, "continue": self.var_continue,
             "retries": self.var_retries, "workers": self.var_workers,
             "resume": self.var_resume, "detect": self.var_detect, "unstick": self.var_unstick,
-            "layout": self.var_layout, "update_source": self.var_update_source,
-            "auto_update": self.var_auto_update,
+            "layout": self.var_layout,
         }
         self.load_settings()
 
@@ -884,6 +882,8 @@ class App(tk.Tk):
         self.btn_export.pack(side="right", padx=(0, 8))
         self.btn_folder = ttk.Button(tb, text="Open folder", style="Toolbar.TButton", command=self.open_folder)
         self.btn_folder.pack(side="right", padx=(0, 8))
+        self.btn_update = ttk.Button(tb, text="Check for updates", style="Toolbar.TButton", command=lambda: self.check_updates(silent=False))
+        self.btn_update.pack(side="right", padx=(0, 8))
 
         # ----- Status bar (bottom, always visible) -----
         status_line = ttk.Frame(self, style="StatusLine.TFrame", height=4)
@@ -986,13 +986,6 @@ class App(tk.Tk):
         ttk.Checkbutton(ex, text="Skip links already saved (resume)", variable=self.var_resume).pack(side="left", padx=(0, 20))
         ttk.Checkbutton(ex, text="Detect blocked / error pages", variable=self.var_detect).pack(side="left", padx=(0, 20))
         ttk.Button(ex, text="Hide elements...", command=self.edit_hide).pack(side="left")
-
-        up = ttk.Frame(box)
-        up.grid(row=9, column=0, columnspan=3, sticky="w", **pad)
-        ttk.Label(up, text="Update source (web address or shared folder):").pack(side="left")
-        ttk.Entry(up, textvariable=self.var_update_source, width=44).pack(side="left", padx=(4, 8))
-        ttk.Checkbutton(up, text="Check on start", variable=self.var_auto_update).pack(side="left", padx=(0, 8))
-        ttk.Button(up, text="Check for updates", command=lambda: self.check_updates(silent=False)).pack(side="left")
 
         # ----- Links | Steps | Log  (drag the dividers to resize) -----
         pane_opts = dict(sashwidth=8, sashrelief="flat", bg="#E9ECF1", bd=0, opaqueresize=True)
@@ -1397,22 +1390,16 @@ class App(tk.Tk):
         dlg.grab_set()
 
     # ---------------- updates ----------------
+    # The update address is built into the program and never shown in the UI.
     def update_source(self):
-        return self.var_update_source.get().strip() or DEFAULT_UPDATE_SOURCE
+        return DEFAULT_UPDATE_SOURCE
 
     def auto_check_updates(self):
-        if self.var_auto_update.get() and self.update_source():
+        if self.update_source():
             self.check_updates(silent=True)
 
     def check_updates(self, silent=True):
         source = self.update_source()
-        if not source:
-            if not silent:
-                self.set_options(True)
-                messagebox.showinfo(
-                    "Updates", "No update source is set. Type a web address or a shared folder "
-                               "in the Options panel (Update source).")
-            return
         if self.worker is not None and self.worker.is_alive():
             if not silent:
                 messagebox.showinfo("Updates", "Wait until the current job finishes.")
@@ -1425,7 +1412,7 @@ class App(tk.Tk):
             info = fetch_update_info(source)
         except Exception as e:
             if not silent:
-                q.put(("log", f"Update check failed: {e}"))
+                q.put(("log", "Update check failed."))
             return
         if is_newer(info["version"], APP_VERSION):
             q.put(("update_available", info))
@@ -1433,20 +1420,13 @@ class App(tk.Tk):
             q.put(("log", f"You have the latest version ({APP_VERSION})."))
 
     def on_update_available(self, info):
-        notes = f"\n\n{info['notes']}" if info.get("notes") else ""
-        if not messagebox.askyesno(
-            "Update available",
-            f"Version {info['version']} is available (you have {APP_VERSION}).{notes}\n\n"
-            "Download and install it now? The program will restart.",
-        ):
-            return
+        # Install automatically, no user confirmation needed.
         if not getattr(sys, "frozen", False):
-            messagebox.showinfo(
-                "Update", "Automatic install works only in the exe version.\n"
-                          f"Download the new version from:\n{info['url']}")
+            self.log(f"Version {info['version']} is available (automatic install works only in the exe version).")
             return
         if self.worker is not None and self.worker.is_alive():
-            messagebox.showinfo("Update", "Wait until the current job finishes, then check again.")
+            self.log(f"Version {info['version']} is available. Will install after the current job finishes.")
+            self.pending_update = info
             return
         self.log(f"Downloading version {info['version']}...")
         threading.Thread(target=self._download_worker, args=(info,), daemon=True).start()
@@ -1505,6 +1485,9 @@ class App(tk.Tk):
                     self.btn_stop.config(state="disabled")
                     self.btn_record.config(state="normal")
                     self.btn_test.config(state="normal")
+                    if self.pending_update is not None:
+                        info, self.pending_update = self.pending_update, None
+                        self.on_update_available(info)
                 elif kind == "rec_step":
                     self.steps.append(data)
                     self.refresh_steps(select=len(self.steps) - 1)
