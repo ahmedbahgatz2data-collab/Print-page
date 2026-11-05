@@ -274,7 +274,7 @@ APP_VERSION = "1.0.0"
 #   GitHub releases:  https://api.github.com/repos/OWNER/REPO/releases/latest
 #   a manifest file:  https://example.com/webtopdf/version.json
 #   a shared folder:  \\server\share\WebToPDF   (contains version.json and the exe)
-DEFAULT_UPDATE_SOURCE = ""
+DEFAULT_UPDATE_SOURCE = "https://api.github.com/repos/ahmedbahgatz2data-collab/Print-page/releases/latest"
 
 LAYOUT_PAGED = "Normal pages"
 LAYOUT_LONG = "Single long page"
