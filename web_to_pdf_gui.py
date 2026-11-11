@@ -268,7 +268,7 @@ def num(var, default):
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
 STATUS_HEADER = ["Link", "Page Link", "Filename", "Date&Time", "Status", "Notes"]
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 # Where the program looks for new versions. Set it before you build the exe
 # (users can also type it in the Options panel). It can be:
 #   GitHub releases:  https://api.github.com/repos/OWNER/REPO/releases/latest
