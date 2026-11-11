@@ -276,6 +276,90 @@ APP_VERSION = "1.0.0"
 #   a shared folder:  \\server\share\WebToPDF   (contains version.json and the exe)
 DEFAULT_UPDATE_SOURCE = "https://api.github.com/repos/ahmedbahgatz2data-collab/Print-page/releases/latest"
 
+# Waits until the browser has finished fetching everything the page asked for
+# (images, stylesheets, fonts, scripts). The document itself is already loaded
+# at this point; these two checks only make sure nothing is still in flight, so
+# that late-arriving graphics and CSS rules are not missing from the PDF.
+READY_STATE_JS = r"""
+var timeout = arguments[0];
+var end = Date.now() + timeout;
+return new Promise(function (resolve) {
+  function done() { return Date.now() >= end; }
+  function check() {
+    var ready = document.readyState === 'complete';
+    var inflight = 0;
+    try {
+      var list = performance.getEntriesByType('resource');
+      for (var i = 0; i < list.length; i++) {
+        var e = list[i];
+        if (!e.responseEnd) inflight++;            // still downloading
+        else if (Date.now() - e.responseEnd < 400) inflight++;  // just arrived
+      }
+    } catch (err) {}
+    if ((ready && inflight === 0) || Date.now() >= end) { resolve(true); return; }
+    setTimeout(check, 200);
+  }
+  check();
+});
+"""
+
+# Force every lazy-loaded image to load now: pages reveal pictures only when
+# they scroll into view, and a PDF of the whole page needs them all at once.
+LOAD_IMAGES_JS = r"""
+var imgs = document.querySelectorAll('img[data-src], img[data-lazy-src], img[data-original],'
+                                     + ' img[data-srcset], img[loading="lazy"], picture source[data-srcset]');
+for (var i = 0; i < imgs.length; i++) {
+  var el = imgs[i];
+  var s = el.getAttribute('data-src') || el.getAttribute('data-lazy-src') || el.getAttribute('data-original');
+  if (s && el.tagName === 'IMG') el.src = s;
+  var ss = el.getAttribute('data-srcset') || el.getAttribute('data-lazy-srcset');
+  if (ss) el.srcset = ss;
+  el.loading = 'eager';
+}
+var bgs = document.querySelectorAll('*');
+for (var j = 0; j < bgs.length; j++) {
+  try {
+    var bg = getComputedStyle(bgs[j]).backgroundImage;
+    if (bg && bg !== 'none' && /url\(/.test(bg)) {
+      var m = bg.match(/url\(["']?([^"')]+)["']?\)/);
+      if (m && !/^data:/i.test(m[1])) {
+        var probe = new Image();
+        probe.src = m[1];
+      }
+    }
+  } catch (e) {}
+}
+return true;
+"""
+
+# Wait for the web fonts, then for every image to be fully decoded, so the PDF
+# never shows text with a fallback font or empty grey boxes instead of graphics.
+WAIT_ASSETS_JS = r"""
+var timeout = arguments[0];
+var end = Date.now() + timeout;
+function pendingImages() {
+  var list = document.images, n = 0;
+  for (var i = 0; i < list.length; i++) {
+    var im = list[i];
+    if (!im.complete) { n++; continue; }
+    if (im.naturalWidth === 0 && im.currentSrc) n++;   // failed / still resolving
+  }
+  return n;
+}
+return new Promise(function (resolve) {
+  function step() {
+    var fonts = (document.fonts && document.fonts.status !== 'loaded') ? 1 : 0;
+    if ((fonts === 0 && pendingImages() === 0) || Date.now() >= end) { resolve(true); return; }
+    setTimeout(step, 150);
+  }
+  step();
+});
+"""
+
+# Give the layout one extra frame after the assets arrive (lazy libraries such
+# as IntersectionObserver need a paint cycle before they show their content).
+SETTLE_JS = "return new Promise(function (r) { requestAnimationFrame(function () { setTimeout(function () { r(true); }, 300); }); });"
+
 LAYOUT_PAGED = "Normal pages"
 LAYOUT_LONG = "Single long page"
 LAYOUT_FIT = "Fit on one page"
@@ -1942,7 +2026,11 @@ class App(tk.Tk):
             "savefile.default_directory": cfg["folder"],
         }
         options = webdriver.ChromeOptions()
-        options.page_load_strategy = "none"
+        # 'eager' (not 'none'): the browser itself waits for the document and
+        # every stylesheet to be applied before returning from driver.get().
+        # With 'none' the code moved on while CSS/images were still arriving,
+        # which produced PDFs with missing graphics and unstyled elements.
+        options.page_load_strategy = "eager"
         options.add_argument("--start-maximized")
         options.add_argument("--kiosk-printing")
         options.add_experimental_option("prefs", prefs)
@@ -2010,7 +2098,9 @@ class App(tk.Tk):
 
     def make_direct_options(self, cfg):
         options = webdriver.ChromeOptions()
-        options.page_load_strategy = "none"
+        # Same reason as the visible engine: never return from driver.get()
+        # before the document and its stylesheets are actually applied.
+        options.page_load_strategy = "eager"
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         if cfg.get("stealth"):
@@ -2070,6 +2160,9 @@ class App(tk.Tk):
             result = driver.execute_cdp_cmd("Page.printToPDF", {
                 "printBackground": True, "displayHeaderFooter": False, "scale": scale_,
                 "paperWidth": w_in, "paperHeight": paper_h, "landscape": False,
+                # No page-break rules from the site may cut graphics away: the
+                # whole content is rendered on one continuous page.
+                "preferCSSPageSize": False,
                 "marginTop": MARGIN_IN, "marginBottom": MARGIN_IN,
                 "marginLeft": MARGIN_IN, "marginRight": MARGIN_IN,
             })
@@ -2148,6 +2241,38 @@ class App(tk.Tk):
                 text += f"  SIZE DIFFERS from {cfg['page_size']}"
         return text
 
+    def await_page_ready(self, driver, cfg, tag=""):
+        """Make sure stylesheets, images and fonts really arrived before saving.
+
+        A page is not finished when its HTML lands: the CSS files, pictures and
+        web fonts keep downloading after that. If the PDF is produced at that
+        moment, graphics are missing and elements show up unstyled. Here we
+        wait for the network to go quiet, force lazy-loaded images to load,
+        then wait for the web fonts and image decoding - always with a hard
+        time limit (the "Page load wait" setting + 20 s) so nothing hangs.
+        """
+        budget = max(5.0, float(cfg.get("load_wait", 5))) + 20.0
+        try:
+            driver.set_script_timeout(120)
+        except Exception:
+            pass
+        try:
+            driver.execute_async_script(READY_STATE_JS, int(budget * 1000))
+        except Exception:
+            pass
+        try:
+            driver.execute_script(LOAD_IMAGES_JS)
+        except Exception:
+            pass
+        try:
+            driver.execute_async_script(WAIT_ASSETS_JS, int(min(budget, 30) * 1000))
+        except Exception:
+            pass
+        try:
+            driver.execute_async_script(SETTLE_JS)
+        except Exception:
+            pass
+
     def wait_for_new_pdf(self, folder, before, timeout):
         """Wait for a new PDF to appear and finish writing. Returns its real file name."""
         deadline = time.time() + timeout
@@ -2171,7 +2296,9 @@ class App(tk.Tk):
 
     def process_url(self, driver, i, link, cfg, tag=""):
         driver.get(link)
-        time.sleep(cfg["load_wait"])
+        # Wait until the page really finished loading its stylesheets, images
+        # and fonts (with a time limit), instead of trusting a fixed sleep.
+        self.await_page_ready(driver, cfg, tag)
         if cfg["stop_loading"]:
             driver.execute_script("window.stop();")
 
@@ -2184,12 +2311,29 @@ class App(tk.Tk):
         if steps:
             self.run_steps(driver, steps, cfg, tag)
             time.sleep(cfg["after_steps"])
+            # Clicking steps often loads more content; give it the same chance
+            # to arrive before the page is captured.
+            self.await_page_ready(driver, cfg, tag)
 
         if cfg["hide"] or cfg["unstick"]:
             try:
                 driver.execute_script(HIDE_JS, cfg["hide"], cfg["unstick"])
             except Exception:
                 pass
+
+        # Reveal everything that only appears when scrolled into view, then
+        # scroll back to the top so lazy graphics are present in the PDF.
+        try:
+            driver.execute_script(
+                "var h = document.body ? document.body.scrollHeight : 0;"
+                "var step = window.innerHeight || 800;"
+                "for (var y = 0; y < h; y += step) { window.scrollTo(0, y); }"
+                "window.scrollTo(0, 0);"
+                "return true;")
+            driver.execute_async_script(WAIT_ASSETS_JS, 8000)
+            driver.execute_script("window.scrollTo(0, 0); return true;")
+        except Exception:
+            pass
 
         stamp = time.strftime("%H-%M-%S")
         is_test = cfg.get("test", False)
