@@ -88,7 +88,7 @@ def num(var, default):
 ALL_SITES = "*"
 ALL_SITES_LABEL = "All sites (default)"
 STATUS_HEADER = ["Link", "Page Link", "Filename", "Date&Time", "Status", "Notes"]
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 DEFAULT_UPDATE_SOURCE = "https://api.github.com/repos/ahmedbahgatz2data-collab/Print-page/releases/latest"
 
 LAYOUT_PAGED = "Normal pages"
