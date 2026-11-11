@@ -2030,7 +2030,7 @@ class App(tk.Tk):
         # every stylesheet to be applied before returning from driver.get().
         # With 'none' the code moved on while CSS/images were still arriving,
         # which produced PDFs with missing graphics and unstyled elements.
-        options.page_load_strategy = "normal"
+        options.page_load_strategy = "none"
         options.add_argument("--start-maximized")
         options.add_argument("--kiosk-printing")
         options.add_experimental_option("prefs", prefs)
@@ -2100,7 +2100,7 @@ class App(tk.Tk):
         options = webdriver.ChromeOptions()
         # Same reason as the visible engine: never return from driver.get()
         # before the document and its stylesheets are actually applied.
-        options.page_load_strategy = "normal"
+        options.page_load_strategy = "none"
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         if cfg.get("stealth"):
